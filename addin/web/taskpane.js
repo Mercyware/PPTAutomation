@@ -198,16 +198,9 @@
     var uiState = window.PPTAutomation.uiState;
     if (uiState.isRecommending) return;
 
-    var promptEl = document.getElementById('prompt');
     var recEl = document.getElementById('recommendations');
     var previewEl = document.getElementById('planPreview');
     var recommendBtn = document.getElementById('recommendBtn');
-
-    var userPrompt = String((promptEl && promptEl.value) || '').trim();
-    if (!userPrompt) {
-      setStatus('Enter a prompt first.');
-      return;
-    }
 
     if (typeof window.PPTAutomation.collectSlideContext !== 'function') {
       setStatus('Slide collector is unavailable.');
@@ -237,6 +230,7 @@
       .then(function (slideContext) {
         uiState.latestSlideContext = slideContext;
         var summarized = buildSummaryContextWithImage(slideContext);
+        var userPrompt = buildAutoPromptFromContext(slideContext);
         setStatus('Generating recommendations...');
         return fetch('/api/recommendations', {
           method: 'POST',
@@ -249,13 +243,14 @@
             });
           }
           return response.json().then(function (payload) {
-            return { payload: payload, summarized: summarized };
+            return { payload: payload, summarized: summarized, userPrompt: userPrompt };
           });
         });
       })
       .then(function (data) {
         var payload = data.payload || {};
         var summarized = data.summarized || {};
+        var userPrompt = data.userPrompt || '';
         var recommendations = Array.isArray(payload.recommendations) ? payload.recommendations : [];
 
         renderRecommendations(recommendations, function (recommendation) {
@@ -288,6 +283,78 @@
       }, function () {
         cleanupRecommendState();
       });
+  }
+
+  function buildAutoPromptFromContext(slideContext) {
+    var objects = slideContext && Array.isArray(slideContext.objects) ? slideContext.objects : [];
+    var title = inferSlideTitle(objects);
+    var snippets = [];
+    var i;
+    for (i = 0; i < objects.length && snippets.length < 8; i += 1) {
+      var text = objects[i] && typeof objects[i].text === 'string' ? objects[i].text.trim() : '';
+      if (text) snippets.push(text);
+    }
+    var contentSummary = snippets.length ? snippets.join(' | ').slice(0, 800) : 'No detailed body content found.';
+    var selected = slideContext && slideContext.selection && Array.isArray(slideContext.selection.shapeIds)
+      ? slideContext.selection.shapeIds
+      : [];
+    var selectionSummary = selected.length ? ('Selected shape IDs: ' + selected.join(', ')) : 'No shapes selected.';
+    var fonts = slideContext && slideContext.themeHints && Array.isArray(slideContext.themeHints.fonts)
+      ? slideContext.themeHints.fonts.slice(0, 4)
+      : [];
+    var colors = slideContext && slideContext.themeHints && Array.isArray(slideContext.themeHints.colors)
+      ? slideContext.themeHints.colors.slice(0, 6)
+      : [];
+    var styleSummary = 'Fonts: ' + (fonts.length ? fonts.join(', ') : 'unknown') +
+      '; Colors: ' + (colors.length ? colors.join(', ') : 'unknown');
+
+    return [
+      'You are helping improve one PowerPoint slide.',
+      '',
+      'Goal:',
+      'Predict the likely user intent and complete the slide toward that intended final state.',
+      '',
+      'Context:',
+      '- Slide title: ' + title,
+      '- Current content summary: ' + contentSummary,
+      '- Selected object(s): ' + selectionSummary,
+      '- Theme/style hints: ' + styleSummary,
+      '',
+      'Instructions:',
+      '1. Infer the primary intent and desired final slide outcome.',
+      '2. Act as a completion engine: fill missing sections/placeholders with ready-to-use content.',
+      '3. Propose the best output format (list, table, chart, image, or layout-improvement).',
+      '4. Include at least one formatting/layout recommendation when readability or hierarchy can improve.',
+      '5. Preserve existing design and placeholders where possible.',
+      '6. Keep recommendations concise, high-confidence, and presentation-ready.'
+    ].join('\\n');
+  }
+
+  function inferSlideTitle(objects) {
+    var i;
+    var candidates = [];
+    for (i = 0; i < objects.length; i += 1) {
+      var obj = objects[i] || {};
+      var text = typeof obj.text === 'string' ? obj.text.trim() : '';
+      if (!text) continue;
+      var name = String(obj.name || '').toLowerCase();
+      var top = Number.POSITIVE_INFINITY;
+      if (Array.isArray(obj.bbox) && obj.bbox.length > 1) {
+        top = Number(obj.bbox[1]);
+      }
+      candidates.push({ text: text, name: name, top: top });
+    }
+
+    for (i = 0; i < candidates.length; i += 1) {
+      if (candidates[i].name.indexOf('title') >= 0) {
+        return candidates[i].text.slice(0, 180);
+      }
+    }
+
+    candidates.sort(function (a, b) {
+      return a.top - b.top;
+    });
+    return candidates.length ? candidates[0].text.slice(0, 180) : 'Untitled slide';
   }
 
   function wireUiHandlers() {

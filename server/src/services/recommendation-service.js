@@ -144,6 +144,47 @@ function defaultDescriptionForType(outputType) {
   }
 }
 
+function isFormattingRecommendation(item) {
+  return item.outputType === "layout-improvement";
+}
+
+function isCompletionRecommendation(item) {
+  return item.outputType !== "layout-improvement";
+}
+
+function ensureCoverageCandidates(items) {
+  const enhanced = [...items];
+
+  const hasFormatting = enhanced.some((item) => isFormattingRecommendation(item));
+  const hasCompletion = enhanced.some((item) => isCompletionRecommendation(item));
+
+  if (!hasFormatting) {
+    enhanced.push({
+      id: "format-for-readability",
+      title: "Improve formatting readability",
+      description:
+        "Refine spacing, font hierarchy, and alignment so the slide is easier to scan and present.",
+      outputType: "layout-improvement",
+      confidence: 0.86,
+      applyHints: ["align-to-grid", "increase-whitespace", "preserve-theme"],
+    });
+  }
+
+  if (!hasCompletion) {
+    enhanced.push({
+      id: "complete-core-content",
+      title: "Complete the core content",
+      description:
+        "Fill missing placeholders with concise, audience-ready content aligned to the inferred slide intent.",
+      outputType: "list",
+      confidence: 0.87,
+      applyHints: ["fill-placeholders", "preserve-theme", "keep-editable"],
+    });
+  }
+
+  return enhanced;
+}
+
 function enforceRecommendationQuality(items) {
   const deduped = [];
   const seenKeys = new Set();
@@ -160,11 +201,31 @@ function enforceRecommendationQuality(items) {
   const byConfidence = deduped.sort((a, b) => b.confidence - a.confidence);
 
   const selected = [];
-  const usedTypes = new Set();
+  const usedIds = new Set();
+
+  const formatting = byConfidence.find((item) => isFormattingRecommendation(item));
+  if (formatting) {
+    selected.push(formatting);
+    usedIds.add(formatting.id);
+  }
+
+  const completion = byConfidence.find(
+    (item) => isCompletionRecommendation(item) && !usedIds.has(item.id)
+  );
+  if (completion) {
+    selected.push(completion);
+    usedIds.add(completion.id);
+  }
+
+  const usedTypes = new Set(selected.map((item) => item.outputType));
 
   for (const item of byConfidence) {
+    if (usedIds.has(item.id)) {
+      continue;
+    }
     if (!usedTypes.has(item.outputType)) {
       selected.push(item);
+      usedIds.add(item.id);
       usedTypes.add(item.outputType);
     }
     if (selected.length >= 4) {
@@ -174,8 +235,9 @@ function enforceRecommendationQuality(items) {
 
   if (selected.length < 3) {
     for (const item of byConfidence) {
-      if (selected.indexOf(item) === -1) {
+      if (!usedIds.has(item.id)) {
         selected.push(item);
+        usedIds.add(item.id);
       }
       if (selected.length >= 3) {
         break;
@@ -228,7 +290,8 @@ function normalizeRecommendations(raw) {
       confidence: Math.max(0.35, Math.min(0.98, item.confidence)),
     }));
 
-  return enforceRecommendationQuality(normalized);
+  const withCoverage = ensureCoverageCandidates(normalized);
+  return enforceRecommendationQuality(withCoverage);
 }
 
 function fallbackPlan(selectedRecommendation, userPrompt) {

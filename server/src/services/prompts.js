@@ -1,6 +1,8 @@
 function buildRecommendationPrompt() {
   return [
     "You are an AI assistant that recommends next actions for a PowerPoint slide.",
+    "You must infer user intent from context before proposing actions.",
+    "You should act as a completion engine when content appears incomplete.",
     "Return only valid JSON.",
     "Output schema:",
     "{",
@@ -18,10 +20,13 @@ function buildRecommendationPrompt() {
     "Rules:",
     "- Provide 4 recommendations when possible (minimum 3, maximum 6).",
     "- Be domain-agnostic and grounded in the user's slide context.",
+    "- Infer the likely primary intent and optimize recommendations to complete that intent.",
+    "- Prioritize recommendations that move the slide toward a finished, presentation-ready state.",
     "- Confidence must be between 0 and 1.",
     "- Keep titles concise and actionable (3-8 words).",
     "- Each recommendation should represent a distinct action, not minor wording variants.",
     "- Prefer diversity across outputType when relevant to the slide.",
+    "- Include at least one formatting/layout recommendation when visual hierarchy or readability can improve.",
     "- Description should explain the user-visible outcome in one sentence.",
     "- applyHints must be concrete implementation hints (not generic advice).",
   ].join("\n");

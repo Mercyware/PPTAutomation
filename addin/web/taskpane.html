@@ -6,17 +6,14 @@
     <title>PPT Automation</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-    <script defer src="/src/slide-context-collector.js?v=6"></script>
-    <script defer src="/src/plan-applier.js?v=6"></script>
-    <script defer src="/taskpane.js?v=6"></script>
+    <script defer src="/src/slide-context-collector.js?v=8"></script>
+    <script defer src="/src/plan-applier.js?v=8"></script>
+    <script defer src="/taskpane.js?v=8"></script>
   </head>
   <body>
     <main class="app">
       <h1>PPT Automation</h1>
-      <p class="subtle">Generate recommendations from the active slide.</p>
-
-      <label for="prompt">Prompt</label>
-      <textarea id="prompt" rows="4" placeholder="Describe what you want to do on this slide"></textarea>
+      <p class="subtle">Generate recommendations automatically from the active slide context.</p>
 
       <div class="actions">
         <button id="recommendBtn" type="button" onclick="if(window.PPTAutomation && window.PPTAutomation.handleRecommend){window.PPTAutomation.handleRecommend();}">Get Recommendations</button>
