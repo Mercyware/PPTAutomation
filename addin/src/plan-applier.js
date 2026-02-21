@@ -138,14 +138,123 @@ async function applyOperation({
     return { applied: false, warnings: ["Skipped operation with missing type"] };
   }
 
-  if (type === "delete") {
-    debugLog("Skipping delete operation", operation);
-    return { applied: false, warnings: ["Delete operations are not auto-applied in this phase"] };
-  }
-
   const warnings = [];
   const tableRows = extractTableRows(operation);
   const imagePayload = extractImagePayload(operation);
+  const chartPayload = extractChartPayload(operation);
+  const intendedTarget = resolveIntendedExistingTarget({
+    shapeById,
+    operation,
+    selectedShapeIds,
+    slideContext,
+  });
+
+  if (type === "delete") {
+    if (!intendedTarget) {
+      return {
+        applied: false,
+        warnings: ["Skipped delete: intended target was not found."],
+      };
+    }
+    const deleted = tryDeleteShape(intendedTarget);
+    if (!deleted) {
+      return {
+        applied: false,
+        warnings: ["Delete operation failed: target exists but could not be deleted."],
+      };
+    }
+    shapeById.delete(intendedTarget.id);
+    rebuildOccupiedRectsFromShapes(shapeById, occupiedRects);
+    return { applied: true, warnings: [] };
+  }
+
+  if ((type === "update" || type === "transform") && intendedTarget) {
+    if (tableRows && tableRows.length > 0) {
+      const updatedTable = await trySetShapeTable(context, intendedTarget, tableRows);
+      if (updatedTable) {
+        return { applied: true, warnings };
+      }
+
+      if (type === "transform") {
+        const preferred = getPreferredBboxForShape(intendedTarget, slideContext);
+        const insertedTable = await tryInsertTable(
+          context,
+          slide,
+          tableRows,
+          operation,
+          slideContext,
+          preferred,
+          occupiedRects
+        );
+        if (insertedTable) {
+          const deleted = tryDeleteShape(intendedTarget);
+          if (deleted) {
+            shapeById.delete(intendedTarget.id);
+            rebuildOccupiedRectsFromShapes(shapeById, occupiedRects);
+          } else {
+            warnings.push("Transformed to table but original target could not be removed.");
+          }
+          return { applied: true, warnings, occupiedBbox: insertedTable };
+        }
+      }
+      warnings.push("Table update/transform could not be applied directly.");
+    }
+
+    if (chartPayload) {
+      const updatedChart = await trySetShapeChart(context, intendedTarget, chartPayload);
+      if (updatedChart) {
+        return { applied: true, warnings };
+      }
+
+      if (type === "transform") {
+        const preferred = getPreferredBboxForShape(intendedTarget, slideContext);
+        const insertedChart = await tryInsertChart(
+          context,
+          slide,
+          chartPayload,
+          operation,
+          slideContext,
+          preferred,
+          occupiedRects
+        );
+        if (insertedChart) {
+          const deleted = tryDeleteShape(intendedTarget);
+          if (deleted) {
+            shapeById.delete(intendedTarget.id);
+            rebuildOccupiedRectsFromShapes(shapeById, occupiedRects);
+          } else {
+            warnings.push("Transformed to chart but original target could not be removed.");
+          }
+          return { applied: true, warnings, occupiedBbox: insertedChart };
+        }
+
+        const rows = chartPayloadToRows(chartPayload);
+        if (rows && rows.length > 0) {
+          const insertedChartTable = await tryInsertTable(
+            context,
+            slide,
+            rows,
+            operation,
+            slideContext,
+            preferred,
+            occupiedRects
+          );
+          if (insertedChartTable) {
+            const deleted = tryDeleteShape(intendedTarget);
+            if (deleted) {
+              shapeById.delete(intendedTarget.id);
+              rebuildOccupiedRectsFromShapes(shapeById, occupiedRects);
+            } else {
+              warnings.push("Chart transformed to table fallback; original target remains.");
+            }
+            warnings.push("Chart transform used editable table fallback.");
+            return { applied: true, warnings, occupiedBbox: insertedChartTable };
+          }
+        }
+      }
+      warnings.push("Chart update/transform could not be applied directly.");
+    }
+  }
 
   if (type === "insert" && imagePayload) {
     debugLog("Attempting image insert", imagePayload);
@@ -162,6 +271,40 @@ async function applyOperation({
       return { applied: true, warnings, occupiedBbox: insertedImage };
     }
     warnings.push("Image insert failed on this host; falling back to text rendering.");
+  }
+
+  if (type === "insert" && chartPayload) {
+    debugLog("Attempting chart insert", chartPayload);
+    const insertedChart = await tryInsertChart(
+      context,
+      slide,
+      chartPayload,
+      operation,
+      slideContext,
+      null,
+      occupiedRects
+    );
+    if (insertedChart) {
+      return { applied: true, warnings, occupiedBbox: insertedChart };
+    }
+    warnings.push("Chart insert is unavailable on this host; falling back to table/text rendering.");
+
+    const chartRows = chartPayloadToRows(chartPayload);
+    if (chartRows && chartRows.length > 0) {
+      const insertedChartAsTable = await tryInsertTable(
+        context,
+        slide,
+        chartRows,
+        operation,
+        slideContext,
+        null,
+        occupiedRects
+      );
+      if (insertedChartAsTable) {
+        warnings.push("Inserted chart data as an editable table fallback.");
+        return { applied: true, warnings, occupiedBbox: insertedChartAsTable };
+      }
+    }
   }
 
   if (type === "insert" && tableRows && tableRows.length > 0) {
@@ -189,7 +332,7 @@ async function applyOperation({
     return { applied: false, warnings: ["Skipped operation without text content"] };
   }
 
-  const subtitleIntent = type === "insert" && isSubtitleInsertIntent(operation, textContent);
+  const subtitleIntent = type === "insert" && computeSubtitleInsertIntent(operation, textContent);
   let preferredBbox = null;
   if (subtitleIntent) {
     const reserved = reserveSubtitlePlacement({
@@ -206,13 +349,6 @@ async function applyOperation({
     }
   }
 
-  const intendedTarget = resolveIntendedExistingTarget({
-    shapeById,
-    operation,
-    selectedShapeIds,
-    slideContext,
-  });
-
   if (type === "update" || type === "transform") {
     if (!intendedTarget) {
       return {
@@ -223,11 +359,17 @@ async function applyOperation({
       };
     }
 
-      const written = trySetShapeText(intendedTarget, textContent, operation.styleBindings || {}, slideContext);
-      if (written) {
-        usedShapeIds.add(intendedTarget.id);
-        return { applied: true, warnings };
-      }
+    const written = trySetShapeText(
+      intendedTarget,
+      textContent,
+      operation.styleBindings || {},
+      slideContext,
+      { preserveExistingStyle: true }
+    );
+    if (written) {
+      usedShapeIds.add(intendedTarget.id);
+      return { applied: true, warnings };
+    }
 
     return { applied: false, warnings: [...warnings, `Failed ${type}: target exists but is not writable`] };
   }
@@ -237,7 +379,13 @@ async function applyOperation({
   if (targetShape && type === "insert") {
     const safeToWrite = isSafeInsertTarget(targetShape, operation, slideContext);
     if (safeToWrite) {
-      const written = trySetShapeText(targetShape, textContent, operation.styleBindings || {}, slideContext);
+      const written = trySetShapeText(
+        targetShape,
+        textContent,
+        operation.styleBindings || {},
+        slideContext,
+        { preserveExistingStyle: true }
+      );
       if (written) {
         usedShapeIds.add(targetShape.id);
         return { applied: true, warnings };
@@ -253,7 +401,13 @@ async function applyOperation({
       excludedShapeIds: targetShape ? [targetShape.id] : [],
     });
     if (alternativeTarget) {
-      const written = trySetShapeText(alternativeTarget, textContent, operation.styleBindings || {}, slideContext);
+      const written = trySetShapeText(
+        alternativeTarget,
+        textContent,
+        operation.styleBindings || {},
+        slideContext,
+        { preserveExistingStyle: true }
+      );
       if (written) {
         usedShapeIds.add(alternativeTarget.id);
         return { applied: true, warnings };
@@ -302,6 +456,15 @@ function extractTextContent(operation) {
   const imagePayload = extractImagePayload(operation);
   if (imagePayload && imagePayload.url) {
     return `Image reference: ${imagePayload.url}`;
+  }
+
+  const chartPayload = extractChartPayload(operation);
+  if (chartPayload) {
+    const rows = chartPayloadToRows(chartPayload);
+    if (rows && rows.length > 0) {
+      return rows.map((row) => row.join(" | ")).join("\n").trim();
+    }
+    return "Chart placeholder";
   }
 
   return "";
@@ -408,6 +571,50 @@ function extractImagePayload(operation) {
   return null;
 }
 
+function extractChartPayload(operation) {
+  const content = operation && operation.content && typeof operation.content === "object" ? operation.content : null;
+  if (!content || !content.chart || typeof content.chart !== "object") {
+    return null;
+  }
+
+  const chart = content.chart;
+  const type = typeof chart.type === "string" && chart.type.trim() ? chart.type.trim().toLowerCase() : "bar";
+  const series = Array.isArray(chart.series) ? chart.series : [];
+  if (!series.length) {
+    return null;
+  }
+
+  return {
+    type,
+    series: series.map((s) => ({
+      name: typeof s?.name === "string" && s.name.trim() ? s.name.trim() : "Series",
+      data: Array.isArray(s?.data) ? s.data : [],
+    })),
+  };
+}
+
+function chartPayloadToRows(chartPayload) {
+  if (!chartPayload || !Array.isArray(chartPayload.series) || !chartPayload.series.length) {
+    return null;
+  }
+
+  const firstSeries = chartPayload.series[0];
+  const rows = [["Category", firstSeries.name || "Value"]];
+  for (const point of firstSeries.data) {
+    const label = typeof point?.label === "string" ? point.label : "";
+    const value =
+      point && (typeof point.value === "number" || typeof point.value === "string")
+        ? String(point.value)
+        : "";
+    if (!label && !value) {
+      continue;
+    }
+    rows.push([label, value]);
+  }
+
+  return rows.length > 1 ? rows : null;
+}
+
 function normalizeEscapedNewLines(text) {
   let output = String(text || "");
   for (let i = 0; i < 3; i += 1) {
@@ -430,12 +637,37 @@ function resolveTargetShape(shapeById, targetId) {
 }
 
 function resolveIntendedExistingTarget({ shapeById, operation, selectedShapeIds, slideContext }) {
+  const anchor = operation?.anchor;
+  if (
+    anchor &&
+    typeof anchor === "object" &&
+    String(anchor.strategy || "").toLowerCase() === "placeholder"
+  ) {
+    const anchoredPlaceholder = resolveTargetFromAnchor(shapeById, slideContext, anchor);
+    if (anchoredPlaceholder) {
+      return anchoredPlaceholder;
+    }
+
+    // Placeholder anchors are strong intent; avoid ambiguous numeric fallback.
+    const rawTarget = typeof operation?.target === "string" ? operation.target.trim() : "";
+    if (rawTarget) {
+      const explicitById = resolveTargetShape(shapeById, rawTarget);
+      if (explicitById) {
+        return explicitById;
+      }
+      const explicitByName = resolveTargetByName(shapeById, slideContext, rawTarget);
+      if (explicitByName) {
+        return explicitByName;
+      }
+    }
+    return null;
+  }
+
   const targeted = resolveTargetFromReference(shapeById, slideContext, operation?.target);
   if (targeted) {
     return targeted;
   }
 
-  const anchor = operation?.anchor;
   if (anchor && String(anchor.strategy || "").toLowerCase() === "selection") {
     const selected = resolveTargetShapeFromSelection(shapeById, selectedShapeIds);
     if (selected) {
@@ -456,12 +688,18 @@ function resolveTargetFromReference(shapeById, slideContext, ref) {
     return null;
   }
 
-  const direct = resolveTargetShape(shapeById, ref);
+  const normalizedRef = ref.trim();
+  const direct = resolveTargetShape(shapeById, normalizedRef);
   if (direct) {
     return direct;
   }
 
-  const numeric = Number(ref);
+  const named = resolveTargetByName(shapeById, slideContext, normalizedRef);
+  if (named) {
+    return named;
+  }
+
+  const numeric = Number(normalizedRef);
   if (Number.isInteger(numeric)) {
     return resolveTargetFromObjectIndex(shapeById, slideContext, numeric);
   }
@@ -477,6 +715,11 @@ function resolveTargetFromAnchor(shapeById, slideContext, anchor) {
   const ref = typeof anchor.ref === "string" ? anchor.ref.trim() : "";
   if (!ref) {
     return null;
+  }
+
+  const named = resolveTargetByName(shapeById, slideContext, ref);
+  if (named) {
+    return named;
   }
 
   return resolveTargetFromReference(shapeById, slideContext, ref);
@@ -657,21 +900,190 @@ function resolveFirstTextCapableShape(shapeById, usedShapeIds, avoidUsed) {
   return null;
 }
 
-function trySetShapeText(shape, text, styleBindings, slideContext) {
+function trySetShapeText(shape, text, styleBindings, slideContext, options) {
   try {
     if (!shape || !shape.textFrame || !shape.textFrame.textRange) {
       return false;
     }
     shape.textFrame.textRange.text = text;
-    applyTextStyle(shape, text, styleBindings, slideContext);
+    applyTextStyle(shape, text, styleBindings, slideContext, options);
     return true;
   } catch (_error) {
     return false;
   }
 }
 
-function applyTextStyle(shape, text, styleBindings, slideContext) {
+function resolveTargetByName(shapeById, slideContext, ref) {
+  const rawRef = String(ref || "").trim().toLowerCase();
+  const normalizedRef = normalizeLookupToken(ref);
+  if (!rawRef && !normalizedRef) {
+    return null;
+  }
+
+  const objects = Array.isArray(slideContext?.objects) ? slideContext.objects : [];
+  const objectById = new Map(objects.map((obj) => [obj.id, obj]));
+
+  let exactShape = null;
+  for (const shape of shapeById.values()) {
+    const shapeName = String(shape?.name || "").trim().toLowerCase();
+    const objName = String(objectById.get(shape.id)?.name || "").trim().toLowerCase();
+    const shapeNameNormalized = normalizeLookupToken(shapeName);
+    const objNameNormalized = normalizeLookupToken(objName);
+    if ((shapeName && shapeName === rawRef) || (shapeNameNormalized && shapeNameNormalized === normalizedRef)) {
+      exactShape = shape;
+      break;
+    }
+    if ((objName && objName === rawRef) || (objNameNormalized && objNameNormalized === normalizedRef)) {
+      exactShape = shape;
+      break;
+    }
+  }
+  if (exactShape) {
+    return exactShape;
+  }
+
+  const isTitleRef = normalizedRef.includes("title") && !normalizedRef.includes("subtitle");
+  const isSubtitleRef = normalizedRef.includes("subtitle");
+
+  const fuzzy = [];
+  for (const shape of shapeById.values()) {
+    const shapeName = String(shape?.name || "").trim().toLowerCase();
+    const objName = String(objectById.get(shape.id)?.name || "").trim().toLowerCase();
+    const combinedRaw = `${shapeName} ${objName}`.trim();
+    const combinedNormalized = normalizeLookupToken(combinedRaw);
+    if (!combinedRaw) {
+      continue;
+    }
+
+    let score = 0;
+    if (rawRef && combinedRaw.includes(rawRef)) {
+      score += 80;
+    }
+    if (normalizedRef && combinedNormalized.includes(normalizedRef)) {
+      score += 100;
+    }
+    if (isSubtitleRef && combinedNormalized.includes("subtitle")) {
+      score += 60;
+    }
+    if (isTitleRef && combinedNormalized.includes("title") && !combinedNormalized.includes("subtitle")) {
+      score += 55;
+    }
+    if (score > 0) {
+      fuzzy.push({ shape, score });
+    }
+  }
+
+  if (!fuzzy.length) {
+    return null;
+  }
+
+  fuzzy.sort((a, b) => {
+    if (b.score !== a.score) {
+      return b.score - a.score;
+    }
+    return Number(a.shape.top || 0) - Number(b.shape.top || 0);
+  });
+  return fuzzy[0].shape;
+}
+
+function normalizeLookupToken(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function tryDeleteShape(shape) {
+  try {
+    if (!shape || typeof shape.delete !== "function") {
+      return false;
+    }
+    shape.delete();
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function trySetShapeTable(context, shape, rows) {
+  if (!shape || !shape.table || !Array.isArray(rows) || rows.length < 1) {
+    return false;
+  }
+
+  try {
+    const table = shape.table;
+    table.load("rowCount,columnCount");
+    await context.sync();
+
+    const rowCount = Number(table.rowCount || 0);
+    const colCount = Number(table.columnCount || 0);
+    if (rowCount < 1 || colCount < 1) {
+      return false;
+    }
+
+    const maxRows = Math.min(rowCount, rows.length);
+    let wrote = false;
+
+    for (let r = 0; r < maxRows; r += 1) {
+      const row = Array.isArray(rows[r]) ? rows[r] : [];
+      const maxCols = Math.min(colCount, row.length);
+      for (let c = 0; c < maxCols; c += 1) {
+        const value = String(row[c] || "");
+        let cell = null;
+        if (typeof table.getCellOrNullObject === "function") {
+          cell = table.getCellOrNullObject(r, c);
+          cell.load("isNullObject");
+          await context.sync();
+          if (cell.isNullObject) {
+            cell = table.getCellOrNullObject(r + 1, c + 1);
+            cell.load("isNullObject");
+            await context.sync();
+          }
+        }
+        if (cell && !cell.isNullObject) {
+          cell.text = value;
+          wrote = true;
+        }
+      }
+    }
+
+    if (wrote) {
+      await context.sync();
+    }
+    return wrote;
+  } catch (_error) {
+    debugLog("trySetShapeTable failed", _error && _error.message ? _error.message : _error);
+    return false;
+  }
+}
+
+async function trySetShapeChart(context, shape, chartPayload) {
+  if (!shape || !shape.chart || !chartPayload) {
+    return false;
+  }
+
+  // Chart data mutation support varies significantly across hosts.
+  // Keep this conservative: update basic chart type when possible, otherwise fall back.
+  try {
+    const mappedType = mapChartType(chartPayload.type);
+    if (shape.chart && "chartType" in shape.chart) {
+      shape.chart.chartType = mappedType;
+      await context.sync();
+      return true;
+    }
+  } catch (_error) {
+    debugLog("trySetShapeChart type update failed", _error && _error.message ? _error.message : _error);
+  }
+  return false;
+}
+
+function applyTextStyle(shape, text, styleBindings, slideContext, options) {
   if (!shape || !shape.textFrame || !shape.textFrame.textRange) {
+    return;
+  }
+
+  const preserveExistingStyle = Boolean(options && options.preserveExistingStyle);
+  if (preserveExistingStyle) {
     return;
   }
 
@@ -751,6 +1163,27 @@ function countEstimatedLines(text, charsPerLine) {
     lines += Math.ceil(len / charsPerLine);
   }
   return Math.max(1, lines);
+}
+
+function computeSubtitleInsertIntent(operation, text) {
+  try {
+    if (typeof isSubtitleInsertIntent === "function") {
+      return isSubtitleInsertIntent(operation, text);
+    }
+  } catch (_error) {
+    // fallback below
+  }
+
+  const target = String(operation && operation.target ? operation.target : "").toLowerCase();
+  const ref = String(operation && operation.anchor && operation.anchor.ref ? operation.anchor.ref : "").toLowerCase();
+  const normalizedText = String(text || "").trim();
+  const shortText = normalizedText.length > 0 && normalizedText.length <= 180;
+  const mentionsSubtitle =
+    target.indexOf("subtitle") >= 0 ||
+    ref.indexOf("subtitle") >= 0 ||
+    ref.indexOf("below-title") >= 0 ||
+    ref.indexOf("under-title") >= 0;
+  return mentionsSubtitle && shortText;
 }
 
 function isSubtitleInsertIntent(operation, text) {
@@ -1089,6 +1522,54 @@ async function tryInsertImage(context, slide, imagePayload, operation, slideCont
   }
 }
 
+async function tryInsertChart(context, slide, chartPayload, operation, slideContext, preferredBbox, occupiedRects) {
+  if (!slide || !slide.shapes || typeof slide.shapes.addChart !== "function") {
+    debugLog("Chart API unavailable on host");
+    return null;
+  }
+
+  const chartType = mapChartType(chartPayload.type);
+  const chartText = `Chart: ${chartPayload.type || "bar"}`;
+  const bbox = getInsertBbox(operation, slideContext, chartText, preferredBbox, occupiedRects);
+
+  const attempts = [
+    () => slide.shapes.addChart(chartType),
+    () => slide.shapes.addChart(chartType, chartPayload),
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const chartShape = attempt();
+      if (chartShape) {
+        chartShape.left = bbox.left;
+        chartShape.top = bbox.top;
+        chartShape.width = bbox.width;
+        chartShape.height = bbox.height;
+        await context.sync();
+        debugLog("Chart insert success", bbox);
+        return bbox;
+      }
+    } catch (_error) {
+      // try next shape API signature
+    }
+  }
+
+  debugLog("Chart insert failed after API attempts", chartPayload);
+  return null;
+}
+
+function mapChartType(type) {
+  const normalized = String(type || "bar").toLowerCase();
+  // Office hosts differ in accepted chart type tokens; keep conservative mappings.
+  if (normalized.indexOf("line") >= 0) {
+    return "Line";
+  }
+  if (normalized.indexOf("pie") >= 0) {
+    return "Pie";
+  }
+  return "ColumnClustered";
+}
+
 async function resolveImageBase64(imagePayload) {
   if (!imagePayload) {
     return null;
@@ -1140,6 +1621,22 @@ function getInsertBbox(operation, slideContext, text, preferredBbox, occupiedRec
   const hinted = normalizeBbox(preferredBbox);
   if (hinted && isReasonableBox(hinted, slideContext)) {
     return sanitizeBbox(stripRectBounds(hinted), slideContext);
+  }
+
+  const anchorRef = String(operation?.anchor?.ref || "").toLowerCase();
+  if (anchorRef.includes("right-half-of-slide") || anchorRef.includes("right-half")) {
+    const slideWidth = Number(slideContext?.slide?.size?.w || 960);
+    const slideHeight = Number(slideContext?.slide?.size?.h || 540);
+    const rightHalf = sanitizeBbox(
+      {
+        left: Math.floor(slideWidth * 0.52),
+        top: Math.floor(slideHeight * 0.34),
+        width: Math.max(300, Math.floor(slideWidth * 0.42)),
+        height: Math.max(180, Math.floor(slideHeight * 0.44)),
+      },
+      slideContext
+    );
+    return rightHalf;
   }
 
   if (
