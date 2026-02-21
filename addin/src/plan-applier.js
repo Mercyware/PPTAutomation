@@ -189,6 +189,23 @@ async function applyOperation({
     return { applied: false, warnings: ["Skipped operation without text content"] };
   }
 
+  const subtitleIntent = type === "insert" && isSubtitleInsertIntent(operation, textContent);
+  let preferredBbox = null;
+  if (subtitleIntent) {
+    const reserved = reserveSubtitlePlacement({
+      shapeById,
+      slideContext,
+      text: textContent,
+      occupiedRects,
+    });
+    if (reserved && reserved.bbox) {
+      preferredBbox = reserved.bbox;
+      if (Array.isArray(reserved.warnings) && reserved.warnings.length) {
+        warnings.push(...reserved.warnings);
+      }
+    }
+  }
+
   const intendedTarget = resolveIntendedExistingTarget({
     shapeById,
     operation,
@@ -215,7 +232,6 @@ async function applyOperation({
     return { applied: false, warnings: [...warnings, `Failed ${type}: target exists but is not writable`] };
   }
 
-  let preferredBbox = null;
   const targetShape = intendedTarget;
 
   if (targetShape && type === "insert") {
@@ -661,8 +677,10 @@ function applyTextStyle(shape, text, styleBindings, slideContext) {
 
   const font = shape.textFrame.textRange.font;
   const fontSize = estimateReadableFontSize(text, shape.width, shape.height);
+  const subtitleLike = isSubtitleTextShape(shape, text, slideContext);
   if (font && Number.isFinite(fontSize)) {
-    font.size = fontSize;
+    const adjustedSize = subtitleLike ? Math.min(26, Math.max(18, fontSize)) : fontSize;
+    font.size = adjustedSize;
   }
 
   const resolved = resolveStyleBindings(styleBindings || {}, slideContext);
@@ -685,14 +703,24 @@ function applyTextStyle(shape, text, styleBindings, slideContext) {
 
   try {
     // Some hosts support text frame margins; keep a consistent inner padding.
-    const margin = 10;
+    const margin = subtitleLike ? 6 : 10;
     if (shape.textFrame && "marginLeft" in shape.textFrame) shape.textFrame.marginLeft = margin;
     if (shape.textFrame && "marginRight" in shape.textFrame) shape.textFrame.marginRight = margin;
-    if (shape.textFrame && "marginTop" in shape.textFrame) shape.textFrame.marginTop = 8;
-    if (shape.textFrame && "marginBottom" in shape.textFrame) shape.textFrame.marginBottom = 8;
+    if (shape.textFrame && "marginTop" in shape.textFrame) shape.textFrame.marginTop = subtitleLike ? 4 : 8;
+    if (shape.textFrame && "marginBottom" in shape.textFrame) shape.textFrame.marginBottom = subtitleLike ? 4 : 8;
   } catch (_error) {
     // ignore
   }
+}
+
+function isSubtitleTextShape(shape, text, slideContext) {
+  const slideHeight = Number(slideContext?.slide?.size?.h || 540);
+  const cleanText = String(text || "").trim();
+  const lines = cleanText.split(/\r?\n/).filter((line) => line.trim().length > 0).length || 1;
+  const nearTop = Number(shape?.top || 0) < slideHeight * 0.55;
+  const compactBox = Number(shape?.height || 0) <= 110;
+  const shortContent = cleanText.length <= 180 && lines <= 2;
+  return nearTop && compactBox && shortContent;
 }
 
 function estimateReadableFontSize(text, width, height) {
@@ -723,6 +751,195 @@ function countEstimatedLines(text, charsPerLine) {
     lines += Math.ceil(len / charsPerLine);
   }
   return Math.max(1, lines);
+}
+
+function isSubtitleInsertIntent(operation, text) {
+  const target = String(operation && operation.target ? operation.target : "").toLowerCase();
+  const ref = String(operation && operation.anchor && operation.anchor.ref ? operation.anchor.ref : "").toLowerCase();
+  const normalizedText = String(text || "").trim();
+  const shortText = normalizedText.length > 0 && normalizedText.length <= 180;
+  const mentionsSubtitle =
+    target.includes("subtitle") ||
+    ref.includes("subtitle") ||
+    ref.includes("below-title") ||
+    ref.includes("under-title");
+  return mentionsSubtitle && shortText;
+}
+
+function reserveSubtitlePlacement({ shapeById, slideContext, text, occupiedRects }) {
+  const draft = buildSubtitleDraft(slideContext, text, occupiedRects);
+  if (!draft) {
+    return null;
+  }
+
+  if (draft.availableGap >= draft.desiredHeight + 6) {
+    return {
+      bbox: {
+        left: draft.left,
+        top: draft.top,
+        width: draft.width,
+        height: draft.desiredHeight,
+      },
+      warnings: [],
+    };
+  }
+
+  if (!Number.isFinite(draft.primaryTop)) {
+    return {
+      bbox: {
+        left: draft.left,
+        top: draft.top,
+        width: draft.width,
+        height: Math.max(44, Math.min(88, draft.desiredHeight)),
+      },
+      warnings: [],
+    };
+  }
+
+  const neededDelta = draft.desiredHeight + 6 - Math.max(0, draft.availableGap);
+  if (neededDelta <= 0) {
+    return {
+      bbox: {
+        left: draft.left,
+        top: draft.top,
+        width: draft.width,
+        height: draft.desiredHeight,
+      },
+      warnings: [],
+    };
+  }
+
+  const shifted = shiftContentDownForSubtitle({
+    shapeById,
+    slideContext,
+    startTop: draft.primaryTop,
+    delta: neededDelta,
+  });
+  if (!shifted) {
+    const compressedHeight = Math.max(44, Math.min(draft.desiredHeight, draft.availableGap - 6));
+    if (compressedHeight >= 44) {
+      return {
+        bbox: {
+          left: draft.left,
+          top: draft.top,
+          width: draft.width,
+          height: compressedHeight,
+        },
+        warnings: ["Subtitle space was limited; applied compact subtitle placement."],
+      };
+    }
+    return null;
+  }
+
+  rebuildOccupiedRectsFromShapes(shapeById, occupiedRects);
+  return {
+    bbox: {
+      left: draft.left,
+      top: draft.top,
+      width: draft.width,
+      height: draft.desiredHeight,
+    },
+    warnings: ["Shifted lower content to reserve subtitle space under the title."],
+  };
+}
+
+function buildSubtitleDraft(slideContext, text, occupiedRects) {
+  const slideWidth = Number(slideContext?.slide?.size?.w || 960);
+  const slideHeight = Number(slideContext?.slide?.size?.h || 540);
+  const margin = 24;
+  const titleBox = detectTitleBox(slideContext, slideWidth, slideHeight);
+  if (!titleBox) {
+    return null;
+  }
+
+  const desiredWidth = Math.min(slideWidth - margin * 2, Math.max(420, Math.floor(slideWidth * 0.74)));
+  const titleAlignedLeft = Number.isFinite(titleBox.left) ? titleBox.left : Math.floor((slideWidth - desiredWidth) / 2);
+  const left = clamp(titleAlignedLeft, margin, Math.max(margin, slideWidth - desiredWidth - margin));
+  const top = clamp(titleBox.bottom + 10, margin, Math.max(margin, slideHeight - 100 - margin));
+  const desiredHeight = Math.max(48, Math.min(92, estimateHeightFromText(text, 22)));
+  const primaryTop = findPrimaryContentTop(slideContext, occupiedRects, titleBox.bottom + 4);
+  const availableGap = Number.isFinite(primaryTop) ? primaryTop - top : slideHeight - margin - top;
+
+  return {
+    left,
+    top,
+    width: desiredWidth,
+    desiredHeight,
+    availableGap,
+    primaryTop,
+  };
+}
+
+function findPrimaryContentTop(slideContext, occupiedRects, minTop) {
+  const occupied =
+    Array.isArray(occupiedRects) && occupiedRects.length
+      ? occupiedRects
+      : (Array.isArray(slideContext?.objects) ? slideContext.objects : [])
+          .map((obj) => normalizeBbox(obj && obj.bbox))
+          .filter((bbox) => bbox !== null);
+
+  let bestTop = Number.POSITIVE_INFINITY;
+  for (const rect of occupied) {
+    if (!rect) continue;
+    if (rect.top >= minTop && rect.top < bestTop && rect.height > 20 && rect.width > 120) {
+      bestTop = rect.top;
+    }
+  }
+  return bestTop;
+}
+
+function shiftContentDownForSubtitle({ shapeById, slideContext, startTop, delta }) {
+  const slideHeight = Number(slideContext?.slide?.size?.h || 540);
+  const margin = 20;
+  const cleanDelta = Math.max(0, Math.ceil(Number(delta || 0)));
+  if (!cleanDelta) {
+    return true;
+  }
+
+  const movable = [];
+  for (const shape of shapeById.values()) {
+    const top = Number(shape.top);
+    const height = Number(shape.height);
+    if (!Number.isFinite(top) || !Number.isFinite(height)) {
+      continue;
+    }
+    if (top >= startTop - 2) {
+      if (top + cleanDelta + height > slideHeight - margin) {
+        return false;
+      }
+      movable.push(shape);
+    }
+  }
+
+  for (const shape of movable) {
+    shape.top = Number(shape.top) + cleanDelta;
+  }
+
+  const objects = Array.isArray(slideContext?.objects) ? slideContext.objects : [];
+  for (const obj of objects) {
+    if (!obj || !Array.isArray(obj.bbox) || obj.bbox.length !== 4) {
+      continue;
+    }
+    const top = Number(obj.bbox[1]);
+    if (Number.isFinite(top) && top >= startTop - 2) {
+      obj.bbox[1] = top + cleanDelta;
+    }
+  }
+
+  return true;
+}
+
+function rebuildOccupiedRectsFromShapes(shapeById, occupiedRects) {
+  if (!Array.isArray(occupiedRects)) {
+    return;
+  }
+  occupiedRects.length = 0;
+  for (const shape of shapeById.values()) {
+    const rect = normalizeBbox([shape.left, shape.top, shape.width, shape.height]);
+    if (rect) {
+      occupiedRects.push(rect);
+    }
+  }
 }
 
 async function tryInsertTextBox(context, slide, text, operation, slideContext, preferredBbox, occupiedRects) {
@@ -1170,7 +1387,7 @@ function detectTitleBox(slideContext, slideWidth, slideHeight) {
 function isReasonableBox(box, slideContext) {
   const slideWidth = Number(slideContext?.slide?.size?.w || 960);
   const slideHeight = Number(slideContext?.slide?.size?.h || 540);
-  return box.width >= 240 && box.height >= 80 && box.right <= slideWidth + 2 && box.bottom <= slideHeight + 2;
+  return box.width >= 240 && box.height >= 44 && box.right <= slideWidth + 2 && box.bottom <= slideHeight + 2;
 }
 
 function looksLikeCornerDefault(box) {
@@ -1217,7 +1434,11 @@ function resolveStyleBindings(styleBindings, slideContext) {
   if (rawColor) {
     const lower = rawColor.toLowerCase();
     if (lower.startsWith("theme.")) {
-      resolved.color = pickAccentColor(colors);
+      if (lower.includes("text")) {
+        resolved.color = pickTextColor(colors, slideContext);
+      } else {
+        resolved.color = pickAccentColor(colors);
+      }
     } else {
       resolved.color = normalizeColor(rawColor);
     }
@@ -1276,6 +1497,66 @@ function pickAccentColor(colors) {
   return candidates.length ? candidates[0] : null;
 }
 
+function pickTextColor(colors, slideContext) {
+  const fromSlide = findLikelyBodyColor(slideContext);
+  if (fromSlide) {
+    return fromSlide;
+  }
+
+  const candidates = (Array.isArray(colors) ? colors : [])
+    .map((c) => normalizeColor(c))
+    .filter((c) => typeof c === "string");
+  if (!candidates.length) {
+    return null;
+  }
+
+  let best = candidates[0];
+  let bestLum = colorLuminance(best);
+  for (const c of candidates) {
+    const lum = colorLuminance(c);
+    if (lum < bestLum) {
+      best = c;
+      bestLum = lum;
+    }
+  }
+  return best;
+}
+
+function findLikelyBodyColor(slideContext) {
+  const objects = Array.isArray(slideContext?.objects) ? slideContext.objects : [];
+  const counts = new Map();
+  for (const obj of objects) {
+    const raw = obj?.style?.color;
+    const color = normalizeColor(raw);
+    if (!color) continue;
+    const name = String(obj?.name || "").toLowerCase();
+    const boost = name.includes("title") ? 0.4 : 1;
+    counts.set(color, (counts.get(color) || 0) + boost);
+  }
+
+  let best = null;
+  let bestScore = -1;
+  for (const [color, score] of counts.entries()) {
+    const readabilityBonus = 1 - Math.min(1, colorLuminance(color));
+    const total = score + readabilityBonus * 0.25;
+    if (total > bestScore) {
+      best = color;
+      bestScore = total;
+    }
+  }
+  return best;
+}
+
+function colorLuminance(color) {
+  const normalized = normalizeColor(color);
+  if (!normalized) return 1;
+  const hex = normalized.slice(1);
+  const r = parseInt(hex.slice(0, 2), 16) / 255;
+  const g = parseInt(hex.slice(2, 4), 16) / 255;
+  const b = parseInt(hex.slice(4, 6), 16) / 255;
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
 function normalizeColor(color) {
   const raw = String(color || "").trim();
   if (!raw) return null;
@@ -1290,7 +1571,7 @@ function sanitizeBbox(rect, slideContext) {
   const margin = 24;
 
   const minW = 260;
-  const minH = 90;
+  const minH = 44;
 
   let left = Number(rect?.left || 0);
   let top = Number(rect?.top || 0);
