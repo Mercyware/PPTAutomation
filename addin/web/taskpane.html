@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PPT Automation</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <script defer src="/src/slide-context-collector.js?v=6"></script>
+    <script defer src="/src/plan-applier.js?v=6"></script>
+    <script defer src="/taskpane.js?v=6"></script>
+  </head>
+  <body>
+    <main class="app">
+      <h1>PPT Automation</h1>
+      <p class="subtle">Generate recommendations from the active slide.</p>
+
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" rows="4" placeholder="Describe what you want to do on this slide"></textarea>
+
+      <div class="actions">
+        <button id="recommendBtn" type="button" onclick="if(window.PPTAutomation && window.PPTAutomation.handleRecommend){window.PPTAutomation.handleRecommend();}">Get Recommendations</button>
+      </div>
+
+      <section>
+        <h2>Recommendations</h2>
+        <div id="recommendations" class="list"></div>
+      </section>
+
+      <section>
+        <h2>Plan Preview</h2>
+        <pre id="planPreview" class="preview"></pre>
+      </section>
+
+      <p id="status" class="status">Loading add-in...</p>
+    </main>
+
+    <div id="previewOverlay" class="overlay hidden" aria-hidden="true">
+      <div class="overlay-card">
+        <h2>Review Before Apply</h2>
+        <p id="overlaySummary" class="overlay-summary"></p>
+        <div id="overlayWarnings" class="overlay-warnings"></div>
+        <div id="overlayOperations" class="overlay-ops"></div>
+        <div class="overlay-actions">
+          <button id="confirmApplyBtn" type="button">Confirm Apply</button>
+          <button id="rejectApplyBtn" type="button" class="secondary">Reject</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

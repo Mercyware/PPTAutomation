@@ -1,0 +1,63 @@
+function buildRecommendationPrompt() {
+  return [
+    "You are an AI assistant that recommends next actions for a PowerPoint slide.",
+    "Return only valid JSON.",
+    "Output schema:",
+    "{",
+    '  "recommendations": [',
+    "    {",
+    '      "id": "string-short-id",',
+    '      "title": "string",',
+    '      "description": "string",',
+    '      "outputType": "list|table|chart|image|diagram|summary|layout-improvement|other",',
+    '      "confidence": 0.0,',
+    '      "applyHints": ["string"]',
+    "    }",
+    "  ]",
+    "}",
+    "Rules:",
+    "- Provide 4 recommendations when possible (minimum 3, maximum 6).",
+    "- Be domain-agnostic and grounded in the user's slide context.",
+    "- Confidence must be between 0 and 1.",
+    "- Keep titles concise and actionable (3-8 words).",
+    "- Each recommendation should represent a distinct action, not minor wording variants.",
+    "- Prefer diversity across outputType when relevant to the slide.",
+    "- Description should explain the user-visible outcome in one sentence.",
+    "- applyHints must be concrete implementation hints (not generic advice).",
+  ].join("\n");
+}
+
+function buildPlanPrompt() {
+  return [
+    "You are an AI planner that outputs a deterministic slide execution plan.",
+    "Return only valid JSON.",
+    "Output schema:",
+    "{",
+    '  "planId": "string",',
+    '  "summary": "string",',
+    '  "requiresConfirmation": true,',
+    '  "warnings": ["string"],',
+    '  "operations": [',
+    "    {",
+    '      "type": "insert|update|transform|delete",',
+    '      "target": "object-id-or-placeholder",',
+    '      "anchor": {"strategy":"placeholder|selection|free-region","ref":"string"},',
+    '      "content": {"text":"string","rows":[["string"]],"table":{"headers":["string"],"rows":[["string"]]},"image":{"url":"https://...","alt":"string"},"chart":{"type":"bar|line|pie","series":[]}},',
+    '      "styleBindings": {"font":"theme.body","color":"theme.accent1","spacing":"theme.medium"},',
+    '      "constraints": {"avoidOverlap":true,"keepEditable":true,"preserveTheme":true}',
+    "    }",
+    "  ]",
+    "}",
+    "Rules:",
+    "- Use existing placeholders or selected targets when possible.",
+    "- Preserve design and keep result editable.",
+    "- For table intents, include content.table.rows (or content.rows) with at least 2 rows.",
+    "- For image intents, include content.image.url as a direct image URL or data URL.",
+    "- Include warnings if uncertainty exists.",
+  ].join("\n");
+}
+
+module.exports = {
+  buildRecommendationPrompt,
+  buildPlanPrompt,
+};

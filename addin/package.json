@@ -1,0 +1,19 @@
+{
+  "name": "ppt-automation-addin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PowerPoint add-in for AI recommendations and execution plans",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "sideload": "office-addin-debugging start manifest.xml desktop --app powerpoint",
+    "stop": "office-addin-debugging stop manifest.xml desktop"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "office-addin-dev-certs": "^1.13.5"
+  },
+  "devDependencies": {
+    "office-addin-debugging": "^5.1.0"
+  }
+}
