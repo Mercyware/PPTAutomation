@@ -5,6 +5,7 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 const { generateRecommendations, generateExecutionPlan } = require("./services/recommendation-service");
+const { findReferenceForItem } = require("./services/reference-service");
 const { ACTIVE_PROVIDER, ACTIVE_MODEL } = require("./services/ollama-client");
 const { validateSlideContext } = require("./validation/slide-context");
 
@@ -116,6 +117,31 @@ app.post("/api/plans", async (req, res) => {
     return res.status(500).json({
       error: "Failed to generate execution plan",
       details: error.message,
+    });
+  }
+});
+
+app.post("/api/references", async (req, res) => {
+  try {
+    const { itemText, slideContext } = req.body || {};
+    if (!itemText || typeof itemText !== "string") {
+      return res.status(400).json({ error: "itemText is required and must be a string" });
+    }
+
+    debugLog("Incoming /api/references", {
+      itemText: itemText.slice(0, 220),
+      objectCount: Array.isArray(slideContext?.objects) ? slideContext.objects.length : 0,
+    });
+
+    const result = await findReferenceForItem({
+      itemText,
+      slideContext: slideContext || {},
+    });
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to find reference",
+      details: error && error.message ? error.message : String(error),
     });
   }
 });

@@ -208,6 +208,10 @@ npm run stop
 - Input: `{ selectedRecommendation, userPrompt, slideContext }`
 - Output: `{ plan: ExecutionPlan }`
 
+### `POST /api/references`
+- Input: `{ itemText, slideContext }`
+- Output: `{ reference, alternatives }`
+
 ## Next repo tasks
 
 1. Add JSON Schema validation and contract tests.

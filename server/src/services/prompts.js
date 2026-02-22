@@ -62,7 +62,49 @@ function buildPlanPrompt() {
   ].join("\n");
 }
 
+function buildReferenceQueryPrompt() {
+  return [
+    "You generate concise web-search queries for finding trustworthy references.",
+    "Return only valid JSON.",
+    "Output schema:",
+    "{",
+    '  "queries": ["string"]',
+    "}",
+    "Rules:",
+    "- Return 2 to 4 short queries.",
+    "- Focus on authoritative/public sources (reports, institutions, encyclopedic references).",
+    "- Keep each query under 14 words.",
+    "- Keep the core claim/topic terms intact.",
+  ].join("\n");
+}
+
+function buildReferenceSelectionPrompt() {
+  return [
+    "You return exactly one credible reference URL for a slide claim/topic.",
+    "Return only valid JSON.",
+    "Output schema:",
+    "{",
+    '  "reference": {',
+    '    "title": "string",',
+    '    "url": "https://...",',
+    '    "reason": "string",',
+    '    "confidence": 0.0',
+    "  }",
+    "}",
+    "Rules:",
+    "- Return one reference only.",
+    "- URL must be a direct, clickable http(s) page.",
+    "- Prefer authoritative sources (official report pages, reputable institutions, major encyclopedic references).",
+    "- If exact claim-level source is uncertain, pick the best report/index page that supports the topic.",
+    "- For gender-equality ranking/index claims, prefer the Global Gender Gap Report source page or a stable encyclopedia page.",
+    "- Keep reason to one short sentence.",
+    "- confidence must be between 0 and 1.",
+  ].join("\n");
+}
+
 module.exports = {
   buildRecommendationPrompt,
   buildPlanPrompt,
+  buildReferenceQueryPrompt,
+  buildReferenceSelectionPrompt,
 };

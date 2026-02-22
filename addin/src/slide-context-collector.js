@@ -13,7 +13,7 @@ async function collectSlideContext() {
 
     const emptyContext = {
       slide: {},
-      selection: { shapeIds: [] },
+      selection: { shapeIds: [], text: "" },
       themeHints: {},
       objects: [],
     };
@@ -23,6 +23,7 @@ async function collectSlideContext() {
     }
 
     const selectedShapeIds = await getSelectedShapeIds(context);
+    const selectedText = await getSelectedTextContent(context);
     const activeSlide = await resolveActiveSlide(context, slides);
     if (!activeSlide) {
       return emptyContext;
@@ -87,6 +88,7 @@ async function collectSlideContext() {
       },
       selection: {
         shapeIds: selectedShapeIds,
+        text: selectedText,
       },
       themeHints: {
         fonts: Array.from(themeHints.fonts).slice(0, 8),
@@ -120,6 +122,63 @@ async function collectRawSlidePayloads() {
   }
 
   return result;
+}
+
+async function getSelectedTextContent(context) {
+  try {
+    if (
+      context &&
+      context.presentation &&
+      typeof context.presentation.getSelectedTextRange === "function"
+    ) {
+      const selectedRange = context.presentation.getSelectedTextRange();
+      selectedRange.load("text");
+      await context.sync();
+      if (typeof selectedRange.text === "string" && selectedRange.text.trim()) {
+        return selectedRange.text.trim();
+      }
+    }
+  } catch (_error) {
+    // best-effort only
+  }
+
+  try {
+    if (
+      context &&
+      context.presentation &&
+      typeof context.presentation.getSelectedTextRangeOrNullObject === "function"
+    ) {
+      const selectedRangeOrNull = context.presentation.getSelectedTextRangeOrNullObject();
+      selectedRangeOrNull.load("isNullObject,text");
+      await context.sync();
+      if (
+        selectedRangeOrNull &&
+        selectedRangeOrNull.isNullObject === false &&
+        typeof selectedRangeOrNull.text === "string" &&
+        selectedRangeOrNull.text.trim()
+      ) {
+        return selectedRangeOrNull.text.trim();
+      }
+    }
+  } catch (_error) {
+    // best-effort only
+  }
+
+  try {
+    const textData = await getSelectedDataAsyncSafe(Office?.CoercionType?.Text);
+    if (typeof textData === "string") {
+      return textData.trim();
+    }
+    if (textData && typeof textData === "object") {
+      const candidate = textData.value || textData.text || textData.data;
+      if (typeof candidate === "string") {
+        return candidate.trim();
+      }
+    }
+  } catch (_error) {
+    // best-effort only
+  }
+  return "";
 }
 
 function getSelectedDataAsyncSafe(coercionType) {

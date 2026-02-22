@@ -56,6 +56,38 @@ async function start() {
     }
   });
 
+  app.post("/api/references", async (req, res) => {
+    try {
+      const upstream = await fetch(`${BACKEND_BASE_URL}/api/references`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req.body || {}),
+      });
+      const body = await upstream.text();
+      res.status(upstream.status).type("application/json").send(body);
+    } catch (error) {
+      res.status(502).json({
+        error: "Backend proxy failed for references",
+        details: error && error.message ? error.message : String(error),
+      });
+    }
+  });
+
+  app.get("/api/backend-health", async (_req, res) => {
+    try {
+      const upstream = await fetch(`${BACKEND_BASE_URL}/health`, {
+        method: "GET",
+      });
+      const body = await upstream.text();
+      res.status(upstream.status).type("application/json").send(body);
+    } catch (error) {
+      res.status(502).json({
+        error: "Backend health proxy failed",
+        details: error && error.message ? error.message : String(error),
+      });
+    }
+  });
+
   app.get("/health", (_req, res) => {
     res.json({ ok: true, service: "ppt-automation-addin-web", port: PORT });
   });

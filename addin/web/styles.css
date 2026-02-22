@@ -29,6 +29,10 @@ h2 {
   font-size: 12px;
 }
 
+.subtle.compact {
+  margin-bottom: 8px;
+}
+
 label {
   display: block;
   margin-bottom: 6px;
@@ -46,9 +50,22 @@ textarea {
   min-height: 90px;
 }
 
+input[type="text"],
+input[type="url"] {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
 .actions {
   margin-top: 10px;
   margin-bottom: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 button {
@@ -206,4 +223,11 @@ button:hover {
   margin-top: 12px;
   display: flex;
   gap: 8px;
+}
+
+.overlay-error {
+  min-height: 16px;
+  margin: 2px 0 4px;
+  font-size: 12px;
+  color: #b42318;
 }

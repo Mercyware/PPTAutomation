@@ -6,9 +6,9 @@
     <title>PPT Automation</title>
     <link rel="stylesheet" href="/styles.css" />
     <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-    <script defer src="/src/slide-context-collector.js?v=12"></script>
-    <script defer src="/src/plan-applier.js?v=12"></script>
-    <script defer src="/taskpane.js?v=12"></script>
+    <script defer src="/src/slide-context-collector.js?v=32"></script>
+    <script defer src="/src/plan-applier.js?v=32"></script>
+    <script defer src="/taskpane.js?v=32"></script>
   </head>
   <body>
     <main class="app">
@@ -17,7 +17,9 @@
 
       <div class="actions">
         <button id="recommendBtn" type="button" onclick="if(window.PPTAutomation && window.PPTAutomation.handleRecommend){window.PPTAutomation.handleRecommend();}">Get Recommendations</button>
+        <button id="addReferenceBtn" type="button" class="secondary" onclick="if(window.PPTAutomation && window.PPTAutomation.handleAddReference){window.PPTAutomation.handleAddReference();}">Add Reference</button>
       </div>
+      <p class="subtle compact">Select a slide item first, then let AI find and add a trusted source link.</p>
 
       <section>
         <h2>Recommendations</h2>
@@ -41,6 +43,22 @@
         <div class="overlay-actions">
           <button id="confirmApplyBtn" type="button">Confirm Apply</button>
           <button id="rejectApplyBtn" type="button" class="secondary">Reject</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="referenceOverlay" class="overlay hidden" aria-hidden="true">
+      <div class="overlay-card">
+        <h2>Add Reference</h2>
+        <p id="referenceSelectionSummary" class="overlay-summary"></p>
+        <label for="referenceLabelInput">Reference Label</label>
+        <input id="referenceLabelInput" type="text" autocomplete="off" />
+        <label for="referenceUrlInput">Source URL</label>
+        <input id="referenceUrlInput" type="url" autocomplete="off" placeholder="https://example.com/source" />
+        <p id="referenceOverlayError" class="overlay-error"></p>
+        <div class="overlay-actions">
+          <button id="confirmReferenceBtn" type="button">Add Reference</button>
+          <button id="cancelReferenceBtn" type="button" class="secondary">Cancel</button>
         </div>
       </div>
     </div>
