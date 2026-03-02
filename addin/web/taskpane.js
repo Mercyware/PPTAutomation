@@ -4,6 +4,10 @@
   var REFERENCE_LIST_SHAPE_PREFIX = 'PPTAutomationReferenceList_';
   var REFERENCE_HEADER_SHAPE_NAME = 'PPTAutomationReferenceHeader';
   var REFERENCE_BOX_SHAPE_NAME = 'PPTAutomationSourcesBox';
+  var AUTO_RECOMMEND_IDLE_MS = 2400;
+  var AUTO_RECOMMEND_POLL_MS = 1200;
+  var AUTO_RECOMMEND_COOLDOWN_MS = 8000;
+  var AUTO_RECOMMEND_SUPPRESSION_MS = 10000;
 
   if (!window.PPTAutomation) {
     window.PPTAutomation = {};
@@ -15,9 +19,40 @@
       pendingPlan: null,
       isRecommending: false,
       isAddingReference: false,
+      isApplyingPlan: false,
       referenceDialogResolver: null,
       sourceLinksBySlide: {}
     };
+  }
+  if (typeof window.PPTAutomation.uiState.isApplyingPlan !== 'boolean') {
+    window.PPTAutomation.uiState.isApplyingPlan = false;
+  }
+  if (typeof window.PPTAutomation.uiState.recommendationMonitorStarted !== 'boolean') {
+    window.PPTAutomation.uiState.recommendationMonitorStarted = false;
+  }
+  if (typeof window.PPTAutomation.uiState.recommendationMonitorTicking !== 'boolean') {
+    window.PPTAutomation.uiState.recommendationMonitorTicking = false;
+  }
+  if (typeof window.PPTAutomation.uiState.recommendationMonitorTimer !== 'number') {
+    window.PPTAutomation.uiState.recommendationMonitorTimer = null;
+  }
+  if (typeof window.PPTAutomation.uiState.lastObservedActivitySignature !== 'string') {
+    window.PPTAutomation.uiState.lastObservedActivitySignature = '';
+  }
+  if (typeof window.PPTAutomation.uiState.pendingActivitySignature !== 'string') {
+    window.PPTAutomation.uiState.pendingActivitySignature = '';
+  }
+  if (typeof window.PPTAutomation.uiState.pendingActivityAt !== 'number') {
+    window.PPTAutomation.uiState.pendingActivityAt = 0;
+  }
+  if (typeof window.PPTAutomation.uiState.lastRecommendationSignature !== 'string') {
+    window.PPTAutomation.uiState.lastRecommendationSignature = '';
+  }
+  if (typeof window.PPTAutomation.uiState.lastRecommendationAt !== 'number') {
+    window.PPTAutomation.uiState.lastRecommendationAt = 0;
+  }
+  if (typeof window.PPTAutomation.uiState.suppressAutoRecommendUntil !== 'number') {
+    window.PPTAutomation.uiState.suppressAutoRecommendUntil = 0;
   }
 
   function setStatus(message) {
@@ -44,6 +79,54 @@
           : '(default)';
         return 'Backend LLM: ' + provider + ' ' + model;
       });
+  }
+
+  function nowMs() {
+    return Date.now();
+  }
+
+  function isOverlayVisible(id) {
+    var overlay = document.getElementById(id);
+    if (!overlay) {
+      return false;
+    }
+    return !overlay.classList.contains('hidden') && overlay.getAttribute('aria-hidden') !== 'true';
+  }
+
+  function clearPendingAutoRecommendation() {
+    var uiState = window.PPTAutomation.uiState;
+    uiState.pendingActivitySignature = '';
+    uiState.pendingActivityAt = 0;
+  }
+
+  function resetRecommendationMonitorBaseline() {
+    var uiState = window.PPTAutomation.uiState;
+    uiState.lastObservedActivitySignature = '';
+    clearPendingAutoRecommendation();
+  }
+
+  function suppressAutoRecommendations(durationMs) {
+    var uiState = window.PPTAutomation.uiState;
+    uiState.suppressAutoRecommendUntil = nowMs() + Math.max(0, Number(durationMs || 0));
+    clearPendingAutoRecommendation();
+    resetRecommendationMonitorBaseline();
+  }
+
+  function shouldAllowAutomaticRecommendation() {
+    var uiState = window.PPTAutomation.uiState;
+    if (uiState.isRecommending || uiState.isAddingReference || uiState.isApplyingPlan) {
+      return false;
+    }
+    if (nowMs() < Number(uiState.suppressAutoRecommendUntil || 0)) {
+      return false;
+    }
+    if (isOverlayVisible('previewOverlay') || isOverlayVisible('referenceOverlay')) {
+      return false;
+    }
+    if (typeof window.PPTAutomation.collectSlideContext !== 'function') {
+      return false;
+    }
+    return true;
   }
 
   function hidePreviewOverlay() {
@@ -279,6 +362,324 @@
         exportedAt: (slideContext && slideContext.rawSlide && slideContext.rawSlide.exportedAt) || null
       }
     };
+  }
+
+  function collectSelectedTextSnapshot() {
+    if (
+      !Office ||
+      !Office.context ||
+      !Office.context.document ||
+      typeof Office.context.document.getSelectedDataAsync !== 'function' ||
+      !Office.CoercionType ||
+      !Office.CoercionType.Text
+    ) {
+      return Promise.resolve('');
+    }
+
+    return new Promise(function (resolve) {
+      Office.context.document.getSelectedDataAsync(Office.CoercionType.Text, function (asyncResult) {
+        if (!asyncResult || asyncResult.status !== Office.AsyncResultStatus.Succeeded) {
+          resolve('');
+          return;
+        }
+
+        var value = asyncResult.value;
+        if (typeof value === 'string') {
+          resolve(value.trim());
+          return;
+        }
+        if (value && typeof value === 'object') {
+          var candidate = value.value || value.text || value.data;
+          resolve(typeof candidate === 'string' ? candidate.trim() : '');
+          return;
+        }
+        resolve('');
+      });
+    });
+  }
+
+  function buildRecommendationActivitySignature(payload) {
+    var selectedShapeIds = payload && Array.isArray(payload.selectedShapeIds)
+      ? payload.selectedShapeIds
+      : (payload && payload.selection && Array.isArray(payload.selection.shapeIds) ? payload.selection.shapeIds : []);
+    var selectedText = payload && typeof payload.selectedText === 'string'
+      ? payload.selectedText
+      : (payload && payload.selection && typeof payload.selection.text === 'string' ? payload.selection.text : '');
+    var slideId = payload && typeof payload.slideId === 'string'
+      ? payload.slideId
+      : (payload && payload.slide && typeof payload.slide.id === 'string' ? payload.slide.id : 'active');
+    var objects = payload && Array.isArray(payload.objects) ? payload.objects : [];
+    var ranked = [];
+    var i;
+
+    for (i = 0; i < objects.length; i += 1) {
+      var item = objects[i] || {};
+      var text = typeof item.text === 'string' ? squeezeInlineText(item.text).slice(0, 180) : '';
+      var name = typeof item.name === 'string' ? squeezeInlineText(item.name).slice(0, 80) : '';
+      if (!text && !name) {
+        continue;
+      }
+      var top = Number.POSITIVE_INFINITY;
+      var left = Number.POSITIVE_INFINITY;
+      if (Array.isArray(item.bbox) && item.bbox.length >= 2) {
+        top = Number(item.bbox[1]);
+        left = Number(item.bbox[0]);
+      } else {
+        top = Number(item.top);
+        left = Number(item.left);
+      }
+      ranked.push({
+        key: (text || name) + '|' + name,
+        top: Number.isFinite(top) ? top : Number.POSITIVE_INFINITY,
+        left: Number.isFinite(left) ? left : Number.POSITIVE_INFINITY
+      });
+    }
+
+    ranked.sort(function (a, b) {
+      if (a.top !== b.top) {
+        return a.top - b.top;
+      }
+      if (a.left !== b.left) {
+        return a.left - b.left;
+      }
+      return a.key.localeCompare(b.key);
+    });
+
+    var parts = [
+      String(slideId || 'active'),
+      selectedShapeIds.join(','),
+      squeezeInlineText(String(selectedText || '')).slice(0, 600)
+    ];
+    for (i = 0; i < ranked.length && i < 12; i += 1) {
+      parts.push(ranked[i].key);
+    }
+    return parts.join('||');
+  }
+
+  function collectRecommendationActivitySnapshot() {
+    if (typeof PowerPoint === 'undefined' || !PowerPoint || typeof PowerPoint.run !== 'function') {
+      return Promise.resolve(null);
+    }
+
+    return PowerPoint.run(function (context) {
+      var presentation = context.presentation;
+      var slides = presentation.slides;
+      var selectedShapes = null;
+      var selectedTextRangeOrNull = null;
+      var selectedTextRange = null;
+
+      slides.load('items');
+      if (presentation && typeof presentation.getSelectedShapes === 'function') {
+        selectedShapes = presentation.getSelectedShapes();
+        selectedShapes.load('items/id');
+      }
+
+      return context.sync()
+        .then(function () {
+          return resolveActiveSlide(context, slides);
+        })
+        .then(function (activeSlide) {
+          if (!activeSlide) {
+            return null;
+          }
+
+          activeSlide.load('id');
+          var shapes = activeSlide.shapes;
+          shapes.load('items/id,items/name,items/type,items/left,items/top');
+
+          if (presentation && typeof presentation.getSelectedTextRangeOrNullObject === 'function') {
+            selectedTextRangeOrNull = presentation.getSelectedTextRangeOrNullObject();
+            selectedTextRangeOrNull.load('isNullObject,text');
+          } else if (presentation && typeof presentation.getSelectedTextRange === 'function') {
+            selectedTextRange = presentation.getSelectedTextRange();
+            selectedTextRange.load('text');
+          }
+
+          return context.sync().then(function () {
+            var shapeItems = shapes.items || [];
+            var ranked = shapeItems.slice().sort(function (a, b) {
+              var aTop = Number(a && a.top);
+              var bTop = Number(b && b.top);
+              if (aTop !== bTop) {
+                return aTop - bTop;
+              }
+              var aLeft = Number(a && a.left);
+              var bLeft = Number(b && b.left);
+              return aLeft - bLeft;
+            }).slice(0, 12);
+
+            for (var i = 0; i < ranked.length; i += 1) {
+              var shape = ranked[i];
+              try {
+                if (shape && shape.textFrame && shape.textFrame.textRange) {
+                  shape.textFrame.textRange.load('text');
+                }
+              } catch (_error) {
+                // best-effort only
+              }
+            }
+
+            return context.sync().then(function () {
+              return collectSelectedTextSnapshot().then(function (asyncSelectedText) {
+                var selectedShapeIds = [];
+                var selectedItems = selectedShapes && Array.isArray(selectedShapes.items) ? selectedShapes.items : [];
+                for (var j = 0; j < selectedItems.length; j += 1) {
+                  var selectedId = selectedItems[j] && selectedItems[j].id;
+                  if (typeof selectedId === 'string' && selectedId) {
+                    selectedShapeIds.push(selectedId);
+                  }
+                }
+
+                var selectedText = '';
+                if (
+                  selectedTextRangeOrNull &&
+                  selectedTextRangeOrNull.isNullObject === false &&
+                  typeof selectedTextRangeOrNull.text === 'string'
+                ) {
+                  selectedText = selectedTextRangeOrNull.text.trim();
+                } else if (selectedTextRange && typeof selectedTextRange.text === 'string') {
+                  selectedText = selectedTextRange.text.trim();
+                }
+                if (!selectedText && asyncSelectedText) {
+                  selectedText = asyncSelectedText;
+                }
+
+                var snapshotObjects = [];
+                for (var k = 0; k < ranked.length; k += 1) {
+                  var rankedShape = ranked[k] || {};
+                  var shapeText = '';
+                  try {
+                    shapeText = rankedShape && rankedShape.textFrame && rankedShape.textFrame.textRange
+                      ? String(rankedShape.textFrame.textRange.text || '').trim()
+                      : '';
+                  } catch (_error) {
+                    shapeText = '';
+                  }
+
+                  snapshotObjects.push({
+                    name: rankedShape && rankedShape.name ? rankedShape.name : '',
+                    text: shapeText,
+                    top: Number(rankedShape && rankedShape.top),
+                    left: Number(rankedShape && rankedShape.left)
+                  });
+                }
+
+                var signature = buildRecommendationActivitySignature({
+                  slideId: activeSlide.id || 'active',
+                  selectedShapeIds: selectedShapeIds,
+                  selectedText: selectedText,
+                  objects: snapshotObjects
+                });
+
+                return {
+                  slideId: activeSlide.id || 'active',
+                  selectedShapeIds: selectedShapeIds,
+                  selectedText: selectedText,
+                  objects: snapshotObjects,
+                  signature: signature,
+                  hasSignal: Boolean(selectedShapeIds.length || selectedText || snapshotObjects.length)
+                };
+              });
+            });
+          });
+        })
+        .catch(function () {
+          return null;
+        });
+    });
+  }
+
+  function scheduleRecommendationMonitorTick(delayMs) {
+    var uiState = window.PPTAutomation.uiState;
+    if (uiState.recommendationMonitorTimer) {
+      window.clearTimeout(uiState.recommendationMonitorTimer);
+    }
+    uiState.recommendationMonitorTimer = window.setTimeout(function () {
+      pollRecommendationActivity();
+    }, Math.max(100, Number(delayMs || AUTO_RECOMMEND_POLL_MS)));
+  }
+
+  function pollRecommendationActivity() {
+    var uiState = window.PPTAutomation.uiState;
+    if (uiState.recommendationMonitorTicking) {
+      scheduleRecommendationMonitorTick(AUTO_RECOMMEND_POLL_MS);
+      return;
+    }
+    uiState.recommendationMonitorTicking = true;
+
+    collectRecommendationActivitySnapshot()
+      .then(function (snapshot) {
+        if (!snapshot || !snapshot.signature) {
+          return;
+        }
+
+        var currentTime = nowMs();
+        if (!uiState.lastObservedActivitySignature) {
+          uiState.lastObservedActivitySignature = snapshot.signature;
+          clearPendingAutoRecommendation();
+          return;
+        }
+
+        if (!snapshot.hasSignal) {
+          if (snapshot.signature !== uiState.lastObservedActivitySignature) {
+            uiState.lastObservedActivitySignature = snapshot.signature;
+          }
+          clearPendingAutoRecommendation();
+          return;
+        }
+
+        if (snapshot.signature !== uiState.lastObservedActivitySignature) {
+          uiState.lastObservedActivitySignature = snapshot.signature;
+          uiState.pendingActivitySignature = snapshot.signature;
+          uiState.pendingActivityAt = currentTime;
+          return;
+        }
+
+        if (!uiState.pendingActivitySignature || uiState.pendingActivitySignature !== snapshot.signature) {
+          return;
+        }
+
+        if (!shouldAllowAutomaticRecommendation()) {
+          return;
+        }
+
+        if ((currentTime - Number(uiState.pendingActivityAt || 0)) < AUTO_RECOMMEND_IDLE_MS) {
+          return;
+        }
+
+        if (
+          uiState.lastRecommendationSignature === snapshot.signature &&
+          (currentTime - Number(uiState.lastRecommendationAt || 0)) < AUTO_RECOMMEND_COOLDOWN_MS
+        ) {
+          clearPendingAutoRecommendation();
+          return;
+        }
+
+        clearPendingAutoRecommendation();
+        runRecommendationCycle({
+          trigger: 'idle',
+          activitySignature: snapshot.signature
+        });
+      })
+      .catch(function (_error) {
+        // best-effort background polling only
+      })
+      .then(function () {
+        uiState.recommendationMonitorTicking = false;
+        scheduleRecommendationMonitorTick(AUTO_RECOMMEND_POLL_MS);
+      }, function () {
+        uiState.recommendationMonitorTicking = false;
+        scheduleRecommendationMonitorTick(AUTO_RECOMMEND_POLL_MS);
+      });
+  }
+
+  function startRecommendationIdleMonitor() {
+    var uiState = window.PPTAutomation.uiState;
+    if (uiState.recommendationMonitorStarted) {
+      return;
+    }
+    uiState.recommendationMonitorStarted = true;
+    scheduleRecommendationMonitorTick(300);
   }
 
   function requestPlan(payload) {
@@ -1739,6 +2140,8 @@
     }
 
     setStatus('Applying plan to slide...');
+    uiState.isApplyingPlan = true;
+    suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
     window.PPTAutomation.applyExecutionPlan(plan, latestContext)
       .then(function (result) {
         var warnings = result && Array.isArray(result.warnings) ? result.warnings : [];
@@ -1750,6 +2153,9 @@
       })
       .catch(function (error) {
         setStatus((error && error.message) || 'Failed to apply plan');
+      })
+      .then(function () {
+        uiState.isApplyingPlan = false;
       });
   }
 
@@ -1771,6 +2177,7 @@
 
     uiState.isAddingReference = true;
     if (addReferenceBtn) addReferenceBtn.disabled = true;
+    suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
 
     function cleanup() {
       uiState.isAddingReference = false;
@@ -1878,9 +2285,14 @@
       });
   }
 
-  function handleRecommend() {
+  function runRecommendationCycle(options) {
+    var opts = options || {};
+    var trigger = opts.trigger === 'idle' ? 'idle' : 'manual';
     var uiState = window.PPTAutomation.uiState;
-    if (uiState.isRecommending) return;
+    if (uiState.isRecommending) return Promise.resolve(false);
+    if (trigger === 'idle' && !shouldAllowAutomaticRecommendation()) {
+      return Promise.resolve(false);
+    }
 
     var recEl = document.getElementById('recommendations');
     var previewEl = document.getElementById('planPreview');
@@ -1888,13 +2300,14 @@
 
     if (typeof window.PPTAutomation.collectSlideContext !== 'function') {
       setStatus('Slide collector is unavailable.');
-      return;
+      return Promise.resolve(false);
     }
 
     uiState.isRecommending = true;
     if (recommendBtn) recommendBtn.disabled = true;
+    clearPendingAutoRecommendation();
 
-    setStatus('Reading slide...');
+    setStatus(trigger === 'idle' ? 'Typing paused. Reading slide...' : 'Reading slide...');
     if (recEl) recEl.innerHTML = '';
     if (previewEl) previewEl.textContent = '';
     hidePreviewOverlay();
@@ -1907,15 +2320,17 @@
       if (recommendBtn) recommendBtn.disabled = false;
     }
 
-    Promise.resolve()
+    return Promise.resolve()
       .then(function () {
         return window.PPTAutomation.collectSlideContext();
       })
       .then(function (slideContext) {
         uiState.latestSlideContext = slideContext;
+        uiState.lastRecommendationSignature = opts.activitySignature || buildRecommendationActivitySignature(slideContext);
+        uiState.lastRecommendationAt = nowMs();
         var summarized = buildSummaryContextWithImage(slideContext);
         var userPrompt = buildAutoPromptFromContext(slideContext);
-        setStatus('Generating recommendations...');
+        setStatus(trigger === 'idle' ? 'Typing paused. Generating recommendations...' : 'Generating recommendations...');
         return fetch('/api/recommendations', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1957,16 +2372,22 @@
             });
         });
 
-        setStatus('Loaded ' + recommendations.length + ' recommendation(s).');
+        setStatus((trigger === 'idle' ? 'Auto-loaded ' : 'Loaded ') + recommendations.length + ' recommendation(s).');
+        return true;
       })
       .catch(function (error) {
         setStatus((error && error.message) || 'Unexpected error');
+        return false;
       })
       .then(function () {
         cleanupRecommendState();
       }, function () {
         cleanupRecommendState();
       });
+  }
+
+  function handleRecommend() {
+    return runRecommendationCycle({ trigger: 'manual' });
   }
 
   function buildAutoPromptFromContext(slideContext) {
@@ -2081,6 +2502,7 @@
     }
 
     hideReferenceOverlay();
+    startRecommendationIdleMonitor();
 
     setStatus('Ready.');
     fetchBackendHealthSummary()
