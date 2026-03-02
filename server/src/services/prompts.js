@@ -11,7 +11,7 @@ function buildRecommendationPrompt() {
     '      "id": "string-short-id",',
     '      "title": "string",',
     '      "description": "string",',
-    '      "outputType": "list|table|chart|image|diagram|summary|layout-improvement|other",',
+    '      "outputType": "list|table|chart|image|smartart|diagram|summary|layout-improvement|other",',
     '      "confidence": 0.0,',
     '      "applyHints": ["string"]',
     "    }",
@@ -22,6 +22,9 @@ function buildRecommendationPrompt() {
     "- Be domain-agnostic and grounded in the user's slide context.",
     "- Infer the likely primary intent and optimize recommendations to complete that intent.",
     "- Prioritize recommendations that move the slide toward a finished, presentation-ready state.",
+    "- Prioritize visual polish: hierarchy, spacing, alignment, contrast, and readability.",
+    "- Keep recommendations consistent with the current slide theme (font, color, style language).",
+    "- Prefer outputs that improve audience comprehension at presentation time, not just raw content volume.",
     "- Confidence must be between 0 and 1.",
     "- Keep titles concise and actionable (3-8 words).",
     "- Each recommendation should represent a distinct action, not minor wording variants.",
@@ -47,7 +50,7 @@ function buildPlanPrompt() {
     '      "type": "insert|update|transform|delete",',
     '      "target": "object-id-or-placeholder",',
     '      "anchor": {"strategy":"placeholder|selection|free-region","ref":"string"},',
-    '      "content": {"text":"string","rows":[["string"]],"table":{"headers":["string"],"rows":[["string"]]},"image":{"url":"https://...","alt":"string"},"chart":{"type":"bar|line|pie","series":[]}},',
+    '      "content": {"text":"string","rows":[["string"]],"table":{"headers":["string"],"rows":[["string"]]},"image":{"url":"https://...","alt":"string"},"chart":{"type":"bar|line|pie","series":[]},"smartArt":{"layout":"process|cycle|hierarchy|relationship|list|timeline","title":"string","items":[{"title":"string","subtitle":"string"}]}},',
     '      "styleBindings": {"font":"theme.body","color":"theme.accent1","spacing":"theme.medium"},',
     '      "constraints": {"avoidOverlap":true,"keepEditable":true,"preserveTheme":true}',
     "    }",
@@ -56,8 +59,14 @@ function buildPlanPrompt() {
     "Rules:",
     "- Use existing placeholders or selected targets when possible.",
     "- Preserve design and keep result editable.",
+    "- Every insert/update/transform operation must include styleBindings aligned to theme tokens when possible.",
+    "- Ensure visual hierarchy, spacing balance, and readable contrast in all generated content.",
+    "- Keep typography and colors coherent with existing slide theme hints.",
     "- For table intents, include content.table.rows (or content.rows) with at least 2 rows.",
-    "- For image intents, include content.image.url as a direct image URL or data URL.",
+    "- For image intents, include content.image.url as a publicly reachable direct image URL or data URL.",
+    "- Prefer raster formats (.png/.jpg/.jpeg/.webp); avoid SVG unless no raster source exists.",
+    "- For image intents, ensure the visual is directly relevant to the slide topic and title (avoid generic or weakly related images).",
+    "- For smartart/diagram intents, include content.smartArt with a layout and at least 3 items.",
     "- Include warnings if uncertainty exists.",
   ].join("\n");
 }
@@ -102,9 +111,27 @@ function buildReferenceSelectionPrompt() {
   ].join("\n");
 }
 
+function buildImageQueryPrompt() {
+  return [
+    "You generate web image-search queries for presentation slides.",
+    "Return only valid JSON.",
+    "Output schema:",
+    "{",
+    '  "queries": ["string"]',
+    "}",
+    "Rules:",
+    "- Return 3 to 5 concise queries.",
+    "- Queries must be specific to the slide topic and audience intent.",
+    "- Prefer factual, presentation-safe visuals (maps, diagrams, landmarks, data visuals) when relevant.",
+    "- Avoid vague words like 'nice image' or 'beautiful background'.",
+    "- Keep each query under 12 words.",
+  ].join("\n");
+}
+
 module.exports = {
   buildRecommendationPrompt,
   buildPlanPrompt,
   buildReferenceQueryPrompt,
   buildReferenceSelectionPrompt,
+  buildImageQueryPrompt,
 };

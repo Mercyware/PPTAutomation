@@ -3,8 +3,21 @@ const { buildRecommendationPrompt, buildPlanPrompt } = require("./prompts");
 const { tryParseJson } = require("../utils/json");
 const { validateRecommendations, ALLOWED_OUTPUT_TYPES } = require("../validation/recommendations");
 const { validateExecutionPlan } = require("../validation/execution-plan");
+const { resolvePresentationImage } = require("./image-search-service");
 
 const DEBUG_LOGS = process.env.DEBUG_LOGS === "true" || process.env.NODE_ENV !== "production";
+const DESIGN_HINT_KEYWORDS = [
+  "theme",
+  "style",
+  "contrast",
+  "hierarchy",
+  "spacing",
+  "alignment",
+  "readability",
+  "whitespace",
+  "visual",
+  "polish",
+];
 
 function debugLog(label, payload) {
   if (!DEBUG_LOGS) {
@@ -78,12 +91,12 @@ function fallbackRecommendations(userPrompt) {
       applyHints: ["reuse-title-placeholder", "preserve-theme"],
     },
     {
-      id: "convert-to-table",
-      title: "Convert to table",
-      description: "Restructure content into a clean table format.",
-      outputType: "table",
-      confidence: 0.7,
-      applyHints: ["use-content-placeholder", "avoid-overlap"],
+      id: "convert-to-smartart",
+      title: "Convert to SmartArt",
+      description: "Restructure core points into an editable SmartArt-style process visual.",
+      outputType: "smartart",
+      confidence: 0.76,
+      applyHints: ["prefer-smartart", "preserve-theme", "avoid-overlap"],
     },
     {
       id: "next-steps",
@@ -112,14 +125,132 @@ function toKebabId(value, fallback) {
   return normalized || fallback;
 }
 
+function canonicalizeOutputType(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) {
+    return "other";
+  }
+
+  const compact = raw.replace(/[\s_-]+/g, "");
+  if (compact === "layoutimprovement" || compact === "layout") {
+    return "layout-improvement";
+  }
+  if (compact === "bulletlist" || compact === "bullets") {
+    return "list";
+  }
+  if (compact === "smartart" || compact === "smartdiagram" || compact === "diagram") {
+    return "smartart";
+  }
+  return raw;
+}
+
+function toHintToken(value) {
+  return cleanSentence(value, 80)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function normalizeApplyHints(applyHints, outputType) {
+  const source = Array.isArray(applyHints) ? applyHints : [];
+  const defaults = defaultHintsForType(outputType);
+  const combined = source.length > 0 ? source : defaults;
+
+  const normalized = [];
+  const seen = new Set();
+  for (const hint of combined) {
+    const token = toHintToken(hint);
+    if (!token || seen.has(token)) {
+      continue;
+    }
+    seen.add(token);
+    normalized.push(token);
+  }
+
+  if (!seen.has("preserve-theme")) {
+    normalized.push("preserve-theme");
+    seen.add("preserve-theme");
+  }
+  if (!seen.has("avoid-overlap")) {
+    normalized.push("avoid-overlap");
+    seen.add("avoid-overlap");
+  }
+
+  if ((outputType === "layout-improvement" || outputType === "smartart") && !seen.has("improve-visual-hierarchy")) {
+    normalized.push("improve-visual-hierarchy");
+  }
+  if (outputType === "image" && !seen.has("prefer-raster-image-url")) {
+    normalized.push("prefer-raster-image-url");
+  }
+
+  return normalized.slice(0, 8);
+}
+
+function includesAnyKeyword(text, keywords) {
+  const source = String(text || "").toLowerCase();
+  return keywords.some((keyword) => source.includes(keyword));
+}
+
+function isDesignFocusedRecommendation(item) {
+  if (item.outputType === "layout-improvement" || item.outputType === "smartart") {
+    return true;
+  }
+
+  const hints = Array.isArray(item.applyHints) ? item.applyHints : [];
+  if (hints.some((hint) => includesAnyKeyword(hint, DESIGN_HINT_KEYWORDS))) {
+    return true;
+  }
+
+  return includesAnyKeyword(item.description, DESIGN_HINT_KEYWORDS);
+}
+
+function recommendationPresentationPriority(item) {
+  const outputTypeWeights = {
+    "layout-improvement": 0.22,
+    smartart: 0.2,
+    chart: 0.15,
+    image: 0.12,
+    table: 0.1,
+    summary: 0.08,
+    list: 0.06,
+    other: 0.04,
+  };
+
+  let score = Number(item.confidence || 0);
+  score += outputTypeWeights[item.outputType] || outputTypeWeights.other;
+
+  const hints = Array.isArray(item.applyHints) ? item.applyHints : [];
+  for (const hint of hints) {
+    if (includesAnyKeyword(hint, DESIGN_HINT_KEYWORDS)) {
+      score += 0.03;
+    }
+    if (String(hint).includes("preserve-theme")) {
+      score += 0.04;
+    }
+  }
+
+  if (includesAnyKeyword(item.description, DESIGN_HINT_KEYWORDS)) {
+    score += 0.05;
+  }
+
+  return score;
+}
+
+function isSmartArtType(outputType) {
+  return outputType === "smartart" || outputType === "diagram";
+}
+
 function defaultHintsForType(outputType) {
   switch (outputType) {
     case "table":
       return ["prefer-table-shape", "preserve-theme", "avoid-overlap"];
     case "image":
-      return ["insert-image-shape", "preserve-theme", "avoid-overlap"];
+      return ["insert-image-shape", "prefer-raster-image-url", "preserve-theme", "avoid-overlap"];
     case "chart":
       return ["prefer-chart-shape", "preserve-theme", "avoid-overlap"];
+    case "smartart":
+    case "diagram":
+      return ["prefer-smartart", "keep-editable", "preserve-theme", "avoid-overlap"];
     case "summary":
       return ["reuse-title-placeholder", "keep-editable", "preserve-theme"];
     default:
@@ -135,6 +266,9 @@ function defaultDescriptionForType(outputType) {
       return "Transform numeric or categorical content into a chart to make comparisons easier.";
     case "image":
       return "Add a relevant visual to support the slide message without disrupting layout.";
+    case "smartart":
+    case "diagram":
+      return "Turn the content into an editable SmartArt-style visual to clarify flow and structure.";
     case "summary":
       return "Condense slide content into concise key points for faster understanding.";
     case "layout-improvement":
@@ -157,6 +291,7 @@ function ensureCoverageCandidates(items) {
 
   const hasFormatting = enhanced.some((item) => isFormattingRecommendation(item));
   const hasCompletion = enhanced.some((item) => isCompletionRecommendation(item));
+  const hasDesignFocus = enhanced.some((item) => isDesignFocusedRecommendation(item));
 
   if (!hasFormatting) {
     enhanced.push({
@@ -182,6 +317,18 @@ function ensureCoverageCandidates(items) {
     });
   }
 
+  if (!hasDesignFocus) {
+    enhanced.push({
+      id: "theme-visual-polish",
+      title: "Theme and visual polish pass",
+      description:
+        "Harmonize fonts, colors, spacing, and contrast so the slide looks presentation-ready and on-brand.",
+      outputType: "layout-improvement",
+      confidence: 0.89,
+      applyHints: ["preserve-theme", "improve-visual-hierarchy", "increase-whitespace", "improve-contrast"],
+    });
+  }
+
   return enhanced;
 }
 
@@ -198,18 +345,24 @@ function enforceRecommendationQuality(items) {
     deduped.push(item);
   }
 
-  const byConfidence = deduped.sort((a, b) => b.confidence - a.confidence);
+  const byPriority = deduped.sort((a, b) => {
+    const scoreDiff = recommendationPresentationPriority(b) - recommendationPresentationPriority(a);
+    if (Math.abs(scoreDiff) > 0.0001) {
+      return scoreDiff;
+    }
+    return b.confidence - a.confidence;
+  });
 
   const selected = [];
   const usedIds = new Set();
 
-  const formatting = byConfidence.find((item) => isFormattingRecommendation(item));
+  const formatting = byPriority.find((item) => isFormattingRecommendation(item));
   if (formatting) {
     selected.push(formatting);
     usedIds.add(formatting.id);
   }
 
-  const completion = byConfidence.find(
+  const completion = byPriority.find(
     (item) => isCompletionRecommendation(item) && !usedIds.has(item.id)
   );
   if (completion) {
@@ -219,7 +372,7 @@ function enforceRecommendationQuality(items) {
 
   const usedTypes = new Set(selected.map((item) => item.outputType));
 
-  for (const item of byConfidence) {
+  for (const item of byPriority) {
     if (usedIds.has(item.id)) {
       continue;
     }
@@ -234,7 +387,7 @@ function enforceRecommendationQuality(items) {
   }
 
   if (selected.length < 3) {
-    for (const item of byConfidence) {
+    for (const item of byPriority) {
       if (!usedIds.has(item.id)) {
         selected.push(item);
         usedIds.add(item.id);
@@ -265,7 +418,7 @@ function normalizeRecommendations(raw) {
           : `rec-${index + 1}`,
       title: typeof item.title === "string" ? item.title.trim() : "Recommendation",
       description: typeof item.description === "string" ? item.description.trim() : "",
-      outputType: typeof item.outputType === "string" ? item.outputType : "other",
+      outputType: canonicalizeOutputType(item.outputType),
       confidence:
         typeof item.confidence === "number"
           ? Math.max(0, Math.min(1, item.confidence))
@@ -278,10 +431,7 @@ function normalizeRecommendations(raw) {
       description:
         cleanSentence(item.description, 300) || defaultDescriptionForType(item.outputType),
       title: cleanSentence(item.title, 120),
-      applyHints:
-        (item.applyHints.length > 0 ? item.applyHints : defaultHintsForType(item.outputType))
-          .slice(0, 8)
-          .map((hint) => cleanSentence(hint, 80)),
+      applyHints: normalizeApplyHints(item.applyHints, item.outputType),
     }))
     .filter((item) => item.title.length > 0)
     .map((item) => ({
@@ -294,8 +444,47 @@ function normalizeRecommendations(raw) {
   return enforceRecommendationQuality(withCoverage);
 }
 
+function buildFallbackSmartArtItems(title, userPrompt) {
+  const itemLines = cleanSentence(userPrompt, 320)
+    .split(/\s*\|\s*|\s*;\s*|\r?\n+/)
+    .map((line) => cleanSentence(line, 64))
+    .filter((line) => line.length > 0);
+
+  const selected = [];
+  for (const line of itemLines) {
+    if (selected.length >= 6) {
+      break;
+    }
+    selected.push({ title: line });
+  }
+
+  if (selected.length >= 3) {
+    return selected;
+  }
+
+  const safeTitle = cleanSentence(title || "Goal", 52) || "Goal";
+  return [
+    { title: `Define ${safeTitle}` },
+    { title: "Prioritize key drivers" },
+    { title: "Execute key actions" },
+    { title: "Track outcomes" },
+  ];
+}
+
 function fallbackPlan(selectedRecommendation, userPrompt) {
   const title = selectedRecommendation?.title || "Apply recommendation";
+  const outputType = canonicalizeOutputType(selectedRecommendation?.outputType);
+  const content = isSmartArtType(outputType)
+    ? {
+        smartArt: {
+          layout: "process",
+          title,
+          items: buildFallbackSmartArtItems(title, userPrompt),
+        },
+      }
+    : {
+        text: `Apply recommendation: ${title}\nUser prompt: ${userPrompt}`,
+      };
   return {
     planId: `plan-${Date.now()}`,
     summary: `Fallback plan for "${title}"`,
@@ -306,9 +495,7 @@ function fallbackPlan(selectedRecommendation, userPrompt) {
         type: "insert",
         target: "content-placeholder",
         anchor: { strategy: "placeholder", ref: "body" },
-        content: {
-          text: `Apply recommendation: ${title}\nUser prompt: ${userPrompt}`,
-        },
+        content,
         styleBindings: {
           font: "theme.body",
           color: "theme.text1",
@@ -360,6 +547,85 @@ function normalizePlan(raw) {
   };
 }
 
+function getImageContentObject(content) {
+  if (!content || typeof content !== "object") {
+    return null;
+  }
+
+  if (content.image && typeof content.image === "object") {
+    return content.image;
+  }
+
+  if (typeof content.image === "string" && content.image.trim()) {
+    return { url: content.image.trim(), alt: "" };
+  }
+
+  if (typeof content.imageUrl === "string" && content.imageUrl.trim()) {
+    return { url: content.imageUrl.trim(), alt: "" };
+  }
+
+  return null;
+}
+
+async function enrichPlanImages(plan, { selectedRecommendation, userPrompt, slideContext }) {
+  if (!plan || !Array.isArray(plan.operations) || plan.operations.length === 0) {
+    return plan;
+  }
+
+  const warnings = Array.isArray(plan.warnings) ? [...plan.warnings] : [];
+  const operations = [];
+
+  for (const operation of plan.operations) {
+    const op = operation && typeof operation === "object" ? { ...operation } : operation;
+    const imageContent = getImageContentObject(op?.content);
+    if (!imageContent) {
+      operations.push(op);
+      continue;
+    }
+
+    let resolved = null;
+    try {
+      resolved = await resolvePresentationImage({
+        selectedRecommendation,
+        userPrompt,
+        slideContext,
+        content: op.content,
+      });
+    } catch (_error) {
+      resolved = null;
+    }
+
+    if (resolved && resolved.url) {
+      const nextContent = op.content && typeof op.content === "object" ? { ...op.content } : {};
+      const nextImage = {
+        ...(typeof nextContent.image === "object" ? nextContent.image : {}),
+        url: resolved.url,
+        alt:
+          (typeof nextContent.image?.alt === "string" && nextContent.image.alt.trim())
+            ? nextContent.image.alt.trim()
+            : cleanSentence(selectedRecommendation?.title || "Slide visual", 90),
+        query: resolved.query || nextContent.image?.query || "",
+      };
+      nextContent.image = nextImage;
+      delete nextContent.imageUrl;
+      op.content = nextContent;
+      operations.push(op);
+      continue;
+    }
+
+    warnings.push(
+      `Image for operation "${cleanSentence(op?.target || "content", 60)}" could not be validated from search providers.`
+    );
+    operations.push(op);
+  }
+
+  return {
+    ...plan,
+    operations,
+    warnings: Array.from(new Set(warnings)),
+  };
+}
+
 async function generateRecommendations({ userPrompt, slideContext }) {
   const contextSummary = summarizeContext(slideContext);
   const promptPayload = JSON.stringify({ userPrompt, contextSummary }, null, 2);
@@ -376,7 +642,7 @@ async function generateRecommendations({ userPrompt, slideContext }) {
   const normalized = normalizeRecommendations(parsed);
   const validation = validateRecommendations(normalized);
   if (normalized.length > 0 && validation.valid) {
-    return normalized.sort((a, b) => b.confidence - a.confidence);
+    return normalized;
   }
 
   return fallbackRecommendations(userPrompt);
@@ -401,23 +667,29 @@ async function generateExecutionPlan({ selectedRecommendation, userPrompt, slide
   const parsed = tryParseJson(modelResponse);
   const normalized = normalizePlan(parsed);
   if (normalized && normalized.operations.length > 0) {
-    const validation = validateExecutionPlan(normalized);
+    const enriched = await enrichPlanImages(normalized, {
+      selectedRecommendation,
+      userPrompt,
+      slideContext,
+    });
+
+    const validation = validateExecutionPlan(enriched);
     if (!validation.valid) {
       return fallbackPlan(selectedRecommendation, userPrompt);
     }
 
     if (validation.policyWarnings.length > 0) {
       const mergedWarnings = Array.from(
-        new Set([...(normalized.warnings || []), ...validation.policyWarnings])
+        new Set([...(enriched.warnings || []), ...validation.policyWarnings])
       );
       return {
-        ...normalized,
+        ...enriched,
         warnings: mergedWarnings,
         requiresConfirmation: true,
       };
     }
 
-    return normalized;
+    return enriched;
   }
 
   return fallbackPlan(selectedRecommendation, userPrompt);

@@ -135,7 +135,7 @@
         var op = ops[j] || {};
         var item = document.createElement('div');
         item.className = 'overlay-op';
-        var txt = op.content && typeof op.content.text === 'string' ? op.content.text : '(non-text payload)';
+        var txt = summarizeOperationContent(op);
         item.textContent = (j + 1) + '. ' + (op.type || 'unknown') + ' -> ' + (op.target || 'auto-target') + ' | ' + txt.slice(0, 120);
         operations.appendChild(item);
       }
@@ -143,6 +143,41 @@
 
     overlay.classList.remove('hidden');
     overlay.setAttribute('aria-hidden', 'false');
+  }
+
+  function summarizeOperationContent(op) {
+    var content = op && op.content && typeof op.content === 'object' ? op.content : null;
+    if (!content) return '(no content)';
+
+    if (typeof content.text === 'string' && content.text.trim()) {
+      return content.text.trim();
+    }
+
+    if (content.smartArt && typeof content.smartArt === 'object') {
+      var smartItems = Array.isArray(content.smartArt.items) ? content.smartArt.items : [];
+      var layout = typeof content.smartArt.layout === 'string' ? content.smartArt.layout : 'process';
+      return 'SmartArt (' + layout + ', ' + smartItems.length + ' item(s))';
+    }
+
+    if (content.chart && typeof content.chart === 'object') {
+      var chartType = typeof content.chart.type === 'string' ? content.chart.type : 'chart';
+      return 'Chart (' + chartType + ')';
+    }
+
+    if (content.table && typeof content.table === 'object') {
+      var tableRows = Array.isArray(content.table.rows) ? content.table.rows.length : 0;
+      return 'Table (' + tableRows + ' row(s))';
+    }
+
+    if (Array.isArray(content.rows) && content.rows.length) {
+      return 'Rows payload (' + content.rows.length + ' row(s))';
+    }
+
+    if (content.image && typeof content.image === 'object') {
+      return 'Image payload';
+    }
+
+    return '(non-text payload)';
   }
 
   function renderRecommendations(recommendations, onSelect) {
@@ -160,8 +195,18 @@
         var item = document.createElement('article');
         item.className = 'recommendation';
 
+        var top = document.createElement('div');
+        top.className = 'rec-top';
+
         var title = document.createElement('h3');
         title.textContent = rec.title || 'Recommendation';
+
+        var typeChip = document.createElement('span');
+        typeChip.className = 'rec-type';
+        typeChip.textContent = rec.outputType || 'other';
+
+        top.appendChild(title);
+        top.appendChild(typeChip);
 
         var desc = document.createElement('p');
         desc.textContent = rec.description || '';
@@ -169,7 +214,17 @@
         var meta = document.createElement('p');
         meta.className = 'meta';
         var conf = typeof rec.confidence === 'number' ? rec.confidence.toFixed(2) : '0.00';
-        meta.textContent = 'Type: ' + (rec.outputType || 'other') + ' | Confidence: ' + conf;
+        meta.textContent = 'Confidence: ' + conf;
+
+        var hintsRow = document.createElement('div');
+        hintsRow.className = 'rec-hints';
+        var hints = Array.isArray(rec.applyHints) ? rec.applyHints.slice(0, 4) : [];
+        for (var h = 0; h < hints.length; h += 1) {
+          var hint = document.createElement('span');
+          hint.className = 'rec-hint';
+          hint.textContent = hints[h];
+          hintsRow.appendChild(hint);
+        }
 
         var button = document.createElement('button');
         button.type = 'button';
@@ -178,9 +233,12 @@
           onSelect(rec);
         });
 
-        item.appendChild(title);
+        item.appendChild(top);
         item.appendChild(desc);
         item.appendChild(meta);
+        if (hints.length) {
+          item.appendChild(hintsRow);
+        }
         item.appendChild(button);
         recEl.appendChild(item);
       })(recommendations[i]);
@@ -1949,10 +2007,11 @@
       'Instructions:',
       '1. Infer the primary intent and desired final slide outcome.',
       '2. Act as a completion engine: fill missing sections/placeholders with ready-to-use content.',
-      '3. Propose the best output format (list, table, chart, image, or layout-improvement).',
-      '4. Include at least one formatting/layout recommendation when readability or hierarchy can improve.',
-      '5. Preserve existing design and placeholders where possible.',
-      '6. Keep recommendations concise, high-confidence, and presentation-ready.'
+      '3. Prioritize presentation-level quality: visual hierarchy, spacing, contrast, and readability.',
+      '4. Propose the best output format (list, table, chart, image, smartart, or layout-improvement).',
+      '5. Include at least one formatting/layout recommendation when readability or hierarchy can improve.',
+      '6. Preserve existing design system and theme style (fonts/colors/spacing).',
+      '7. Keep recommendations concise, high-confidence, and presentation-ready.'
     ].join('\\n');
   }
 

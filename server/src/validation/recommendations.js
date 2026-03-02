@@ -3,6 +3,7 @@ const ALLOWED_OUTPUT_TYPES = new Set([
   "table",
   "chart",
   "image",
+  "smartart",
   "diagram",
   "summary",
   "layout-improvement",

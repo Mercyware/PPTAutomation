@@ -142,6 +142,7 @@ async function applyOperation({
   const tableRows = extractTableRows(operation);
   const imagePayload = extractImagePayload(operation);
   const chartPayload = extractChartPayload(operation);
+  const smartArtPayload = extractSmartArtPayload(operation);
   const intendedTarget = resolveIntendedExistingTarget({
     shapeById,
     operation,
@@ -169,6 +170,34 @@ async function applyOperation({
   }
 
   if ((type === "update" || type === "transform") && intendedTarget) {
+    if (smartArtPayload) {
+      if (type === "transform") {
+        const preferred = getPreferredBboxForShape(intendedTarget, slideContext);
+        const insertedSmartArt = await tryInsertSmartArt(
+          context,
+          slide,
+          smartArtPayload,
+          operation,
+          slideContext,
+          preferred,
+          occupiedRects
+        );
+        if (insertedSmartArt) {
+          const deleted = tryDeleteShape(intendedTarget);
+          if (deleted) {
+            shapeById.delete(intendedTarget.id);
+            rebuildOccupiedRectsFromShapes(shapeById, occupiedRects);
+          } else {
+            warnings.push("Transformed to SmartArt but original target could not be removed.");
+          }
+          return { applied: true, warnings, occupiedBbox: insertedSmartArt };
+        }
+        warnings.push("SmartArt transform could not be applied directly.");
+      } else {
+        warnings.push("SmartArt update is unsupported for existing shapes; trying text fallback.");
+      }
+    }
+
     if (tableRows && tableRows.length > 0) {
       const updatedTable = await trySetShapeTable(context, intendedTarget, tableRows);
       if (updatedTable) {
@@ -254,6 +283,23 @@ async function applyOperation({
       }
       warnings.push("Chart update/transform could not be applied directly.");
     }
+  }
+
+  if (type === "insert" && smartArtPayload) {
+    debugLog("Attempting SmartArt insert", smartArtPayload);
+    const insertedSmartArt = await tryInsertSmartArt(
+      context,
+      slide,
+      smartArtPayload,
+      operation,
+      slideContext,
+      null,
+      occupiedRects
+    );
+    if (insertedSmartArt) {
+      return { applied: true, warnings, occupiedBbox: insertedSmartArt };
+    }
+    warnings.push("SmartArt insert is unavailable on this host; falling back to text rendering.");
   }
 
   if (type === "insert" && imagePayload) {
@@ -453,11 +499,6 @@ function extractTextContent(operation) {
     return tableRows.map((row) => row.join(" | ")).join("\n").trim();
   }
 
-  const imagePayload = extractImagePayload(operation);
-  if (imagePayload && imagePayload.url) {
-    return `Image reference: ${imagePayload.url}`;
-  }
-
   const chartPayload = extractChartPayload(operation);
   if (chartPayload) {
     const rows = chartPayloadToRows(chartPayload);
@@ -465,6 +506,11 @@ function extractTextContent(operation) {
       return rows.map((row) => row.join(" | ")).join("\n").trim();
     }
     return "Chart placeholder";
+  }
+
+  const smartArtPayload = extractSmartArtPayload(operation);
+  if (smartArtPayload) {
+    return smartArtPayloadToText(smartArtPayload);
   }
 
   return "";
@@ -559,13 +605,17 @@ function extractImagePayload(operation) {
       || "";
     const base64 = typeof image.base64 === "string" && image.base64.trim() ? image.base64.trim() : "";
     const alt = typeof image.alt === "string" ? image.alt.trim() : "";
+    const query = [image.query, image.searchQuery, image.topic, image.keyword]
+      .find((v) => typeof v === "string" && v.trim())
+      || "";
     if (url || base64) {
-      return { url: url.trim(), base64, alt };
+      return { url: url.trim(), base64, alt, query: query.trim() };
     }
   }
 
   if (typeof content.imageUrl === "string" && content.imageUrl.trim()) {
-    return { url: content.imageUrl.trim(), alt: "" };
+    const fallbackQuery = typeof content.imageQuery === "string" ? content.imageQuery.trim() : "";
+    return { url: content.imageUrl.trim(), alt: "", query: fallbackQuery };
   }
 
   return null;
@@ -591,6 +641,179 @@ function extractChartPayload(operation) {
       data: Array.isArray(s?.data) ? s.data : [],
     })),
   };
+}
+
+function extractSmartArtPayload(operation) {
+  const content = operation && operation.content && typeof operation.content === "object" ? operation.content : null;
+  if (!content) {
+    return null;
+  }
+
+  const rawSmartArt =
+    (content.smartArt && typeof content.smartArt === "object" ? content.smartArt : null)
+    || (content.smartart && typeof content.smartart === "object" ? content.smartart : null)
+    || (content.diagram && typeof content.diagram === "object" ? content.diagram : null);
+
+  const rawLayout =
+    typeof rawSmartArt?.layout === "string"
+      ? rawSmartArt.layout
+      : typeof rawSmartArt?.type === "string"
+        ? rawSmartArt.type
+        : typeof content.layout === "string"
+          ? content.layout
+          : "";
+  const layout = normalizeSmartArtLayout(rawLayout);
+
+  let rawItems = [];
+  if (Array.isArray(rawSmartArt?.items)) {
+    rawItems = rawSmartArt.items;
+  } else if (Array.isArray(rawSmartArt?.nodes)) {
+    rawItems = rawSmartArt.nodes;
+  } else if (Array.isArray(rawSmartArt?.steps)) {
+    rawItems = rawSmartArt.steps;
+  } else if (Array.isArray(content.items)) {
+    rawItems = content.items;
+  }
+
+  let items = normalizeSmartArtItems(rawItems);
+  if (items.length < 2 && typeof content.text === "string" && content.text.trim()) {
+    items = normalizeSmartArtItems(parseSmartArtItemsFromText(content.text));
+  }
+  if (items.length < 2 && Array.isArray(content.rows)) {
+    const rowItems = content.rows
+      .filter((row) => Array.isArray(row))
+      .map((row) => row.map((cell) => toCellString(cell)).join(" ").trim())
+      .filter((line) => line.length > 0);
+    items = normalizeSmartArtItems(rowItems);
+  }
+  if (items.length < 2) {
+    return null;
+  }
+
+  const title = cleanSmartArtText(rawSmartArt?.title || content.title || "", 90);
+  const accentColor = normalizeColor(rawSmartArt?.accentColor || rawSmartArt?.color || content.color || "");
+  return {
+    layout,
+    title,
+    items: items.slice(0, 8),
+    accentColor,
+  };
+}
+
+function normalizeSmartArtLayout(value) {
+  const raw = String(value || "").toLowerCase();
+  if (raw.includes("cycle")) {
+    return "cycle";
+  }
+  if (raw.includes("hier")) {
+    return "hierarchy";
+  }
+  if (raw.includes("relation")) {
+    return "relationship";
+  }
+  if (raw.includes("time")) {
+    return "timeline";
+  }
+  if (raw.includes("list")) {
+    return "list";
+  }
+  return "process";
+}
+
+function normalizeSmartArtItems(rawItems) {
+  if (!Array.isArray(rawItems)) {
+    return [];
+  }
+
+  const items = [];
+  const seen = new Set();
+  for (const raw of rawItems) {
+    let title = "";
+    let subtitle = "";
+    if (typeof raw === "string") {
+      title = cleanSmartArtText(raw, 84);
+    } else if (raw && typeof raw === "object") {
+      title = firstSmartArtString(
+        raw.title,
+        raw.label,
+        raw.heading,
+        raw.step,
+        raw.name,
+        raw.text
+      );
+      subtitle = firstSmartArtString(raw.subtitle, raw.description, raw.detail, raw.note);
+      title = cleanSmartArtText(title, 84);
+      subtitle = cleanSmartArtText(subtitle, 96);
+    }
+
+    if (!title) {
+      continue;
+    }
+
+    const key = title.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    items.push({ title, subtitle });
+  }
+  return items;
+}
+
+function firstSmartArtString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function cleanSmartArtText(value, maxLen) {
+  return normalizeEscapedNewLines(String(value || ""))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen || 80);
+}
+
+function parseSmartArtItemsFromText(value) {
+  const normalized = normalizeEscapedNewLines(String(value || "")).trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const directLines = normalized
+    .split(/\r?\n+/)
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+    .filter((line) => line.length > 0);
+  if (directLines.length >= 2) {
+    return directLines;
+  }
+
+  return normalized
+    .split(/\s*\|\s*|\s*;\s*/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function smartArtPayloadToText(smartArtPayload) {
+  if (!smartArtPayload || !Array.isArray(smartArtPayload.items)) {
+    return "";
+  }
+
+  const lines = [];
+  if (smartArtPayload.title) {
+    lines.push(smartArtPayload.title);
+  }
+  for (let i = 0; i < smartArtPayload.items.length; i += 1) {
+    const item = smartArtPayload.items[i];
+    if (!item || !item.title) {
+      continue;
+    }
+    const subtitle = item.subtitle ? ` - ${item.subtitle}` : "";
+    lines.push(`${i + 1}. ${item.title}${subtitle}`);
+  }
+  return lines.join("\n").trim();
 }
 
 function chartPayloadToRows(chartPayload) {
@@ -1558,6 +1781,459 @@ async function tryInsertChart(context, slide, chartPayload, operation, slideCont
   return null;
 }
 
+async function tryInsertSmartArt(context, slide, smartArtPayload, operation, slideContext, preferredBbox, occupiedRects) {
+  if (!slide || !slide.shapes || typeof slide.shapes.addTextBox !== "function" || !smartArtPayload) {
+    return null;
+  }
+
+  const textPreview = smartArtPayloadToText(smartArtPayload) || "SmartArt";
+  const bbox = getInsertBbox(operation, slideContext, textPreview, preferredBbox, occupiedRects);
+
+  const nativeInserted = await tryInsertNativeSmartArt(context, slide, smartArtPayload, bbox);
+  if (nativeInserted) {
+    debugLog("Native SmartArt insert success", { layout: smartArtPayload.layout, bbox });
+    return bbox;
+  }
+
+  try {
+    const rendered = renderSmartArtAsTextShapes(
+      slide,
+      smartArtPayload,
+      bbox,
+      slideContext,
+      operation?.styleBindings || {}
+    );
+    if (!rendered) {
+      return null;
+    }
+    await context.sync();
+    debugLog("SmartArt-style insert success", {
+      layout: smartArtPayload.layout,
+      itemCount: smartArtPayload.items.length,
+      bbox,
+    });
+    return bbox;
+  } catch (_error) {
+    debugLog("SmartArt-style insert failed", _error && _error.message ? _error.message : _error);
+    return null;
+  }
+}
+
+async function tryInsertNativeSmartArt(context, slide, smartArtPayload, bbox) {
+  if (!slide || !slide.shapes) {
+    return false;
+  }
+
+  const addFn =
+    typeof slide.shapes.addSmartArt === "function"
+      ? "addSmartArt"
+      : typeof slide.shapes.addDiagram === "function"
+        ? "addDiagram"
+        : null;
+  if (!addFn) {
+    return false;
+  }
+
+  const attempts = [
+    () => slide.shapes[addFn](smartArtPayload.layout),
+    () => slide.shapes[addFn](smartArtPayload.layout, smartArtPayload),
+    () => slide.shapes[addFn](smartArtPayload),
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const smartShape = attempt();
+      if (!smartShape) {
+        continue;
+      }
+      smartShape.left = bbox.left;
+      smartShape.top = bbox.top;
+      smartShape.width = bbox.width;
+      smartShape.height = bbox.height;
+      await context.sync();
+      return true;
+    } catch (_error) {
+      // try next signature
+    }
+  }
+
+  return false;
+}
+
+function renderSmartArtAsTextShapes(slide, smartArtPayload, bbox, slideContext, styleBindings) {
+  const items = Array.isArray(smartArtPayload?.items) ? smartArtPayload.items : [];
+  if (items.length < 2) {
+    return false;
+  }
+
+  const layout = normalizeSmartArtLayout(smartArtPayload.layout);
+  const hasTitle = typeof smartArtPayload.title === "string" && smartArtPayload.title.trim().length > 0;
+  const contentBounds = resolveSmartArtContentBounds(bbox, hasTitle);
+  const nodeRects = computeSmartArtNodeRects(layout, items.length, contentBounds);
+  if (!nodeRects.length) {
+    return false;
+  }
+
+  const palette = buildSmartArtPalette(smartArtPayload, slideContext, styleBindings);
+  if (hasTitle) {
+    const titleShape = slide.shapes.addTextBox(smartArtPayload.title.trim());
+    if (titleShape) {
+      titleShape.left = bbox.left;
+      titleShape.top = bbox.top;
+      titleShape.width = bbox.width;
+      titleShape.height = Math.max(28, Math.min(44, Math.floor(bbox.height * 0.18)));
+      applyTextStyle(titleShape, smartArtPayload.title, { font: "theme.title", color: "theme.text1" }, slideContext);
+      try {
+        if (titleShape.textFrame && titleShape.textFrame.textRange && titleShape.textFrame.textRange.font) {
+          titleShape.textFrame.textRange.font.bold = true;
+        }
+      } catch (_error) {
+        // ignore
+      }
+    }
+  }
+
+  for (let i = 0; i < nodeRects.length; i += 1) {
+    const rect = nodeRects[i];
+    const item = items[i] || { title: `Item ${i + 1}` };
+    const nodeText = item.subtitle ? `${item.title}\n${item.subtitle}` : item.title;
+    const nodeShape = slide.shapes.addTextBox(nodeText);
+    if (!nodeShape) {
+      continue;
+    }
+
+    nodeShape.left = rect.left;
+    nodeShape.top = rect.top;
+    nodeShape.width = rect.width;
+    nodeShape.height = rect.height;
+
+    const fillColor = palette.nodeColors[i % palette.nodeColors.length];
+    const borderColor = adjustHexColor(fillColor, -24);
+    applyShapeFillColor(nodeShape, fillColor);
+    applyShapeLineColor(nodeShape, borderColor);
+
+    const styleColor = palette.textColor;
+    const nodeStyleBindings = {
+      ...styleBindings,
+      color: styleColor || styleBindings?.color || "theme.text1",
+      font: styleBindings?.font || "theme.body",
+    };
+    applyTextStyle(nodeShape, nodeText, nodeStyleBindings, slideContext);
+    try {
+      if (nodeShape.textFrame && nodeShape.textFrame.textRange && nodeShape.textFrame.textRange.font) {
+        nodeShape.textFrame.textRange.font.bold = true;
+      }
+    } catch (_error) {
+      // ignore
+    }
+  }
+
+  const connectors = computeSmartArtConnectorRects(layout, nodeRects);
+  for (const connector of connectors) {
+    const connectorShape = slide.shapes.addTextBox(connector.text);
+    if (!connectorShape) {
+      continue;
+    }
+    connectorShape.left = connector.left;
+    connectorShape.top = connector.top;
+    connectorShape.width = connector.width;
+    connectorShape.height = connector.height;
+    applyTextStyle(
+      connectorShape,
+      connector.text,
+      { font: "theme.body", color: palette.connectorColor || "theme.text1" },
+      slideContext
+    );
+    try {
+      if (connectorShape.textFrame && connectorShape.textFrame.textRange && connectorShape.textFrame.textRange.font) {
+        connectorShape.textFrame.textRange.font.bold = true;
+      }
+    } catch (_error) {
+      // ignore
+    }
+  }
+
+  return true;
+}
+
+function resolveSmartArtContentBounds(bbox, hasTitle) {
+  const titleHeight = hasTitle ? Math.max(28, Math.min(44, Math.floor(bbox.height * 0.18))) : 0;
+  const topPadding = hasTitle ? 10 : 2;
+  const top = bbox.top + titleHeight + topPadding;
+  const height = Math.max(80, bbox.height - titleHeight - topPadding);
+  return {
+    left: bbox.left,
+    top,
+    width: bbox.width,
+    height,
+  };
+}
+
+function computeSmartArtNodeRects(layout, count, bounds) {
+  const safeCount = Math.max(2, Math.min(8, Number(count || 0)));
+  const inner = {
+    left: bounds.left + 6,
+    top: bounds.top + 4,
+    width: Math.max(260, bounds.width - 12),
+    height: Math.max(90, bounds.height - 8),
+  };
+
+  if (layout === "cycle") {
+    return computeCycleNodeRects(safeCount, inner);
+  }
+  if (layout === "hierarchy") {
+    return computeHierarchyNodeRects(safeCount, inner);
+  }
+  if (layout === "list") {
+    return computeVerticalNodeRects(safeCount, inner);
+  }
+  if (layout === "process" || layout === "timeline" || layout === "relationship") {
+    if (safeCount <= 4) {
+      return computeHorizontalNodeRects(safeCount, inner);
+    }
+    return computeVerticalNodeRects(safeCount, inner);
+  }
+  return computeHorizontalNodeRects(safeCount, inner);
+}
+
+function computeHorizontalNodeRects(count, bounds) {
+  const gap = clamp(Math.floor(bounds.width * 0.02), 8, 18);
+  const nodeWidth = Math.max(120, Math.floor((bounds.width - gap * (count - 1)) / count));
+  const nodeHeight = Math.max(56, Math.min(bounds.height, Math.floor(bounds.height * 0.76)));
+  const totalWidth = nodeWidth * count + gap * (count - 1);
+  const startLeft = bounds.left + Math.max(0, Math.floor((bounds.width - totalWidth) / 2));
+  const top = bounds.top + Math.max(0, Math.floor((bounds.height - nodeHeight) / 2));
+
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    out.push({
+      left: startLeft + i * (nodeWidth + gap),
+      top,
+      width: nodeWidth,
+      height: nodeHeight,
+    });
+  }
+  return out;
+}
+
+function computeVerticalNodeRects(count, bounds) {
+  const gap = clamp(Math.floor(bounds.height * 0.03), 8, 16);
+  const nodeHeight = Math.max(48, Math.floor((bounds.height - gap * (count - 1)) / count));
+  const nodeWidth = Math.max(220, Math.min(bounds.width, Math.floor(bounds.width * 0.9)));
+  const left = bounds.left + Math.max(0, Math.floor((bounds.width - nodeWidth) / 2));
+
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    out.push({
+      left,
+      top: bounds.top + i * (nodeHeight + gap),
+      width: nodeWidth,
+      height: nodeHeight,
+    });
+  }
+  return out;
+}
+
+function computeHierarchyNodeRects(count, bounds) {
+  if (count <= 2) {
+    return computeVerticalNodeRects(count, bounds);
+  }
+
+  const topHeight = Math.max(54, Math.floor(bounds.height * 0.34));
+  const childBounds = {
+    left: bounds.left,
+    top: bounds.top + topHeight + 12,
+    width: bounds.width,
+    height: Math.max(70, bounds.height - topHeight - 12),
+  };
+  const childCount = count - 1;
+  const children = computeHorizontalNodeRects(childCount, childBounds);
+
+  const parentWidth = Math.max(180, Math.min(bounds.width, Math.floor(bounds.width * 0.44)));
+  const parent = {
+    left: bounds.left + Math.max(0, Math.floor((bounds.width - parentWidth) / 2)),
+    top: bounds.top,
+    width: parentWidth,
+    height: topHeight,
+  };
+
+  return [parent, ...children];
+}
+
+function computeCycleNodeRects(count, bounds) {
+  const centerX = bounds.left + bounds.width / 2;
+  const centerY = bounds.top + bounds.height / 2;
+  const nodeWidth = Math.max(120, Math.min(220, Math.floor(bounds.width * 0.26)));
+  const nodeHeight = Math.max(52, Math.min(110, Math.floor(bounds.height * 0.22)));
+  const radiusX = Math.max(30, bounds.width / 2 - nodeWidth / 2 - 6);
+  const radiusY = Math.max(26, bounds.height / 2 - nodeHeight / 2 - 6);
+
+  const out = [];
+  for (let i = 0; i < count; i += 1) {
+    const angle = -Math.PI / 2 + (Math.PI * 2 * i) / count;
+    const x = centerX + radiusX * Math.cos(angle) - nodeWidth / 2;
+    const y = centerY + radiusY * Math.sin(angle) - nodeHeight / 2;
+    out.push({
+      left: Math.round(x),
+      top: Math.round(y),
+      width: nodeWidth,
+      height: nodeHeight,
+    });
+  }
+  return out;
+}
+
+function computeSmartArtConnectorRects(layout, nodeRects) {
+  const connectors = [];
+  if (!Array.isArray(nodeRects) || nodeRects.length < 2) {
+    return connectors;
+  }
+
+  if (layout === "cycle") {
+    return connectors;
+  }
+
+  for (let i = 0; i < nodeRects.length - 1; i += 1) {
+    const current = nodeRects[i];
+    const next = nodeRects[i + 1];
+    const currentCenter = rectCenter(current);
+    const nextCenter = rectCenter(next);
+
+    const horizontal = Math.abs(currentCenter.x - nextCenter.x) >= Math.abs(currentCenter.y - nextCenter.y);
+    if (horizontal) {
+      const left = Math.min(current.right || (current.left + current.width), next.left);
+      const right = Math.max(current.right || (current.left + current.width), next.left);
+      connectors.push({
+        text: "->",
+        left: Math.floor((left + right) / 2) - 8,
+        top: Math.floor((currentCenter.y + nextCenter.y) / 2) - 8,
+        width: 16,
+        height: 16,
+      });
+    } else {
+      const bottom = current.bottom || (current.top + current.height);
+      const top = next.top;
+      connectors.push({
+        text: "v",
+        left: Math.floor((currentCenter.x + nextCenter.x) / 2) - 8,
+        top: Math.floor((bottom + top) / 2) - 8,
+        width: 16,
+        height: 16,
+      });
+    }
+  }
+
+  return connectors;
+}
+
+function rectCenter(rect) {
+  return {
+    x: Number(rect?.left || 0) + Number(rect?.width || 0) / 2,
+    y: Number(rect?.top || 0) + Number(rect?.height || 0) / 2,
+  };
+}
+
+function buildSmartArtPalette(smartArtPayload, slideContext, styleBindings) {
+  const resolved = resolveStyleBindings(styleBindings || {}, slideContext);
+  const colors = Array.isArray(slideContext?.themeHints?.colors) ? slideContext.themeHints.colors : [];
+  const base =
+    normalizeColor(smartArtPayload?.accentColor)
+    || normalizeColor(resolved.color)
+    || pickAccentColor(colors)
+    || "#0B6E4F";
+  const nodeColors = [
+    adjustHexColor(base, 0),
+    adjustHexColor(base, 18),
+    adjustHexColor(base, -14),
+    adjustHexColor(base, 28),
+    adjustHexColor(base, -24),
+    adjustHexColor(base, 8),
+  ];
+
+  const luminance = colorLuminance(base);
+  const textColor = luminance < 0.46 ? "#FFFFFF" : "#101828";
+  const connectorColor = luminance < 0.5 ? "#D1D5DB" : "#344054";
+
+  return {
+    nodeColors,
+    textColor,
+    connectorColor,
+  };
+}
+
+function applyShapeFillColor(shape, color) {
+  if (!shape || !color) {
+    return;
+  }
+
+  try {
+    if (shape.fill && typeof shape.fill.setSolidColor === "function") {
+      shape.fill.setSolidColor(color);
+      return;
+    }
+  } catch (_error) {
+    // ignore
+  }
+
+  try {
+    if (shape.fill && "color" in shape.fill) {
+      shape.fill.color = color;
+      return;
+    }
+  } catch (_error) {
+    // ignore
+  }
+}
+
+function applyShapeLineColor(shape, color) {
+  if (!shape || !color) {
+    return;
+  }
+
+  try {
+    if (shape.lineFormat && typeof shape.lineFormat === "object") {
+      if ("color" in shape.lineFormat) {
+        shape.lineFormat.color = color;
+      }
+      if ("weight" in shape.lineFormat) {
+        shape.lineFormat.weight = 1;
+      }
+      return;
+    }
+  } catch (_error) {
+    // ignore
+  }
+
+  try {
+    if (shape.line && typeof shape.line === "object") {
+      if ("color" in shape.line) {
+        shape.line.color = color;
+      }
+      if ("weight" in shape.line) {
+        shape.line.weight = 1;
+      }
+    }
+  } catch (_error) {
+    // ignore
+  }
+}
+
+function adjustHexColor(color, delta) {
+  const normalized = normalizeColor(color);
+  if (!normalized) {
+    return "#0B6E4F";
+  }
+  const hex = normalized.slice(1);
+  const adjust = (start) => {
+    const value = parseInt(hex.slice(start, start + 2), 16);
+    return clamp(value + Number(delta || 0), 0, 255);
+  };
+  const r = adjust(0).toString(16).padStart(2, "0");
+  const g = adjust(2).toString(16).padStart(2, "0");
+  const b = adjust(4).toString(16).padStart(2, "0");
+  return `#${(r + g + b).toUpperCase()}`;
+}
+
 function mapChartType(type) {
   const normalized = String(type || "bar").toLowerCase();
   // Office hosts differ in accepted chart type tokens; keep conservative mappings.
@@ -1583,21 +2259,366 @@ async function resolveImageBase64(imagePayload) {
     return null;
   }
 
-  const url = String(imagePayload.url).trim();
-  if (url.startsWith("data:image/")) {
-    return stripDataUrlPrefix(url);
+  const sourceUrl = sanitizeLikelyHttpUrl(String(imagePayload.url || "").trim());
+  if (!sourceUrl) {
+    return null;
+  }
+
+  if (sourceUrl.startsWith("data:image/")) {
+    if (isSvgDataUrl(sourceUrl)) {
+      const svgBlob = dataUrlToBlob(sourceUrl);
+      const raster = await svgBlobToPngBase64(svgBlob);
+      if (raster) {
+        return raster;
+      }
+    }
+    return stripDataUrlPrefix(sourceUrl);
+  }
+
+  const candidates = buildImageCandidateUrls(sourceUrl);
+  for (const candidate of candidates) {
+    const base64 = await resolveRemoteImageToBase64(candidate, 0);
+    if (base64) {
+      return base64;
+    }
+  }
+
+  return null;
+}
+
+async function resolveRemoteImageToBase64(url, depth) {
+  if (depth > 2) {
+    return null;
   }
 
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { redirect: "follow" });
     if (!response.ok) {
       return null;
     }
-    const blob = await response.blob();
-    return await blobToBase64(blob);
+
+    const resolvedUrl = response && typeof response.url === "string" ? response.url : url;
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+
+    if (contentType.includes("image/")) {
+      const blob = await response.blob();
+      if (isSvgMimeOrUrl(contentType, resolvedUrl)) {
+        const rasterized = await svgBlobToPngBase64(blob);
+        if (rasterized) {
+          return rasterized;
+        }
+      }
+      return await blobToBase64(blob);
+    }
+
+    if (contentType.includes("text/html") || !contentType) {
+      const html = await response.text();
+      const discoveredUrl = extractLikelyImageUrlFromHtml(html, resolvedUrl);
+      if (discoveredUrl && discoveredUrl !== url) {
+        return await resolveRemoteImageToBase64(discoveredUrl, depth + 1);
+      }
+    }
   } catch (_error) {
     return null;
   }
+
+  return null;
+}
+
+function buildImageCandidateUrls(url) {
+  const candidates = [];
+  const seen = new Set();
+
+  const push = (value) => {
+    const normalized = sanitizeLikelyHttpUrl(String(value || "").trim());
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+
+  const repairedSource = normalizeMalformedWikimediaUploadUrl(url);
+  push(repairedSource || url);
+  if (repairedSource && repairedSource !== url) {
+    push(url);
+  }
+
+  for (const alt of buildWikimediaSvgRasterCandidates(url)) {
+    push(alt);
+  }
+  if (repairedSource && repairedSource !== url) {
+    for (const alt of buildWikimediaSvgRasterCandidates(repairedSource)) {
+      push(alt);
+    }
+  }
+
+  const filePathUrl = buildWikimediaFilePathUrl(url);
+  if (filePathUrl) {
+    push(filePathUrl);
+    push(`${filePathUrl}?width=1600`);
+    for (const alt of buildWikimediaSvgRasterCandidates(filePathUrl)) {
+      push(alt);
+    }
+  }
+
+  const uploadFilePath = buildWikimediaSpecialFilePathFromUpload(url);
+  if (uploadFilePath) {
+    push(uploadFilePath);
+    push(`${uploadFilePath}?width=1600`);
+  }
+
+  return candidates;
+}
+
+function buildWikimediaSvgRasterCandidates(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "upload.wikimedia.org") {
+      return [];
+    }
+
+    const path = parsed.pathname || "";
+    if (path.includes("/thumb/")) {
+      return [];
+    }
+
+    const segments = path.split("/").filter((part) => part.length > 0);
+    if (segments.length < 5 || segments[0] !== "wikipedia" || segments[1] !== "commons") {
+      return [];
+    }
+
+    const hash1 = segments[2];
+    const hash2 = segments[3];
+    let fileName = segments.slice(4).join("/");
+    if (/\.svg\.png$/i.test(fileName)) {
+      fileName = fileName.slice(0, -4);
+    }
+    if (!/\.svg$/i.test(fileName)) {
+      return [];
+    }
+    if (!hash1 || !hash2 || !fileName) {
+      return [];
+    }
+
+    const widths = [1600, 1280, 1024, 800];
+    return widths.map(
+      (width) =>
+        `${parsed.protocol}//${parsed.host}/wikipedia/commons/thumb/${hash1}/${hash2}/${fileName}/${width}px-${fileName}.png`
+    );
+  } catch (_error) {
+    return [];
+  }
+}
+
+function normalizeMalformedWikimediaUploadUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "upload.wikimedia.org") {
+      return url;
+    }
+    if (parsed.pathname.includes("/thumb/")) {
+      return parsed.toString();
+    }
+    if (/\.svg\.png$/i.test(parsed.pathname)) {
+      parsed.pathname = parsed.pathname.replace(/\.svg\.png$/i, ".svg");
+      return parsed.toString();
+    }
+    return parsed.toString();
+  } catch (_error) {
+    return url;
+  }
+}
+
+function buildWikimediaSpecialFilePathFromUpload(url) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== "upload.wikimedia.org") {
+      return null;
+    }
+
+    const segments = (parsed.pathname || "").split("/").filter(Boolean);
+    if (segments.length < 5 || segments[0] !== "wikipedia" || segments[1] !== "commons") {
+      return null;
+    }
+
+    let fileName = segments.slice(4).join("/");
+    if (/\.svg\.png$/i.test(fileName)) {
+      fileName = fileName.slice(0, -4);
+    }
+    if (!fileName) {
+      return null;
+    }
+
+    return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(fileName)}`;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function buildWikimediaFilePathUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "commons.wikimedia.org" && !host.endsWith(".wikipedia.org")) {
+      return null;
+    }
+
+    const decodedPath = decodeURIComponent(parsed.pathname || "");
+    const marker = "/wiki/File:";
+    const markerIndex = decodedPath.indexOf(marker);
+    if (markerIndex < 0) {
+      return null;
+    }
+
+    const fileName = decodedPath.slice(markerIndex + marker.length).trim();
+    if (!fileName) {
+      return null;
+    }
+
+    return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(fileName)}`;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function extractLikelyImageUrlFromHtml(html, baseUrl) {
+  const source = String(html || "");
+  if (!source) {
+    return null;
+  }
+
+  const patterns = [
+    /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["']/i,
+    /<meta[^>]+name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i,
+    /<img[^>]+src=["']([^"']+)["'][^>]*>/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    if (!match || !match[1]) {
+      continue;
+    }
+    const resolved = resolveAbsoluteUrl(match[1], baseUrl);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function sanitizeLikelyHttpUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    return new URL(raw).toString();
+  } catch (_error) {
+    // try a minimally encoded variant
+  }
+
+  try {
+    return new URL(encodeURI(raw)).toString();
+  } catch (_error) {
+    return raw;
+  }
+}
+
+function resolveAbsoluteUrl(value, baseUrl) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return sanitizeLikelyHttpUrl(new URL(raw, baseUrl).toString());
+  } catch (_error) {
+    return null;
+  }
+}
+
+function isSvgDataUrl(value) {
+  return /^data:image\/svg\+xml/i.test(String(value || ""));
+}
+
+function isSvgMimeOrUrl(contentType, url) {
+  const mime = String(contentType || "").toLowerCase();
+  if (mime.includes("image/svg+xml")) {
+    return true;
+  }
+  return /\.svg(?:$|[?#])/i.test(String(url || ""));
+}
+
+async function svgBlobToPngBase64(svgBlob) {
+  if (!svgBlob || typeof document === "undefined") {
+    return null;
+  }
+
+  let objectUrl = null;
+  try {
+    objectUrl = URL.createObjectURL(svgBlob);
+    const image = await loadImageElement(objectUrl);
+
+    const width = Math.max(1, Number(image.naturalWidth || image.width || 0) || 1024);
+    const height = Math.max(1, Number(image.naturalHeight || image.height || 0) || 768);
+    const maxDimension = 1800;
+    const scale = Math.min(1, maxDimension / Math.max(width, height));
+    const renderWidth = Math.max(1, Math.round(width * scale));
+    const renderHeight = Math.max(1, Math.round(height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = renderWidth;
+    canvas.height = renderHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+
+    ctx.drawImage(image, 0, 0, renderWidth, renderHeight);
+    const pngDataUrl = canvas.toDataURL("image/png");
+    return stripDataUrlPrefix(pngDataUrl);
+  } catch (_error) {
+    return null;
+  } finally {
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+}
+
+function dataUrlToBlob(dataUrl) {
+  const value = String(dataUrl || "");
+  const match = value.match(/^data:([^;,]+)?(;base64)?,(.*)$/i);
+  if (!match) {
+    return new Blob([]);
+  }
+
+  const mimeType = match[1] || "application/octet-stream";
+  const isBase64 = Boolean(match[2]);
+  const payload = match[3] || "";
+
+  if (isBase64) {
+    const binary = atob(payload);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: mimeType });
+  }
+
+  return new Blob([decodeURIComponent(payload)], { type: mimeType });
+}
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Failed to decode image"));
+    image.src = src;
+  });
 }
 
 function stripDataUrlPrefix(value) {
