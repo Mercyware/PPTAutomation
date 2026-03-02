@@ -20,10 +20,15 @@ function debugLog(label, payload) {
   console.log(`[plan-applier][${timestamp}] ${label}`, payload !== undefined ? payload : "");
 }
 
-async function applyExecutionPlan(plan, slideContext) {
+async function applyExecutionPlan(plan, slideContext, options) {
   if (!plan || typeof plan !== "object" || !Array.isArray(plan.operations)) {
     throw new Error("Invalid plan payload");
   }
+
+  const targetSlideId =
+    options && typeof options.targetSlideId === "string" && options.targetSlideId.trim()
+      ? options.targetSlideId.trim()
+      : "";
 
   return PowerPoint.run(async (context) => {
     const slides = context.presentation.slides;
@@ -34,7 +39,9 @@ async function applyExecutionPlan(plan, slideContext) {
       throw new Error("No slide found to apply the plan");
     }
 
-    const activeSlide = await resolveActiveSlide(context, slides);
+    const activeSlide = targetSlideId
+      ? await resolveSlideById(context, slides, targetSlideId)
+      : await resolveActiveSlide(context, slides);
     if (!activeSlide) {
       throw new Error("Unable to resolve active slide");
     }
@@ -110,6 +117,35 @@ async function resolveActiveSlide(context, slides) {
   }
 
   return slides.items && slides.items.length > 0 ? slides.items[0] : null;
+}
+
+async function resolveSlideById(context, slides, slideId) {
+  const targetId = typeof slideId === "string" ? slideId.trim() : "";
+  if (!targetId) {
+    return null;
+  }
+
+  const items = slides && Array.isArray(slides.items) ? slides.items : [];
+  for (const slide of items) {
+    if (slide && slide.id === targetId) {
+      return slide;
+    }
+  }
+
+  try {
+    if (slides && typeof slides.getItemOrNullObject === "function") {
+      const slide = slides.getItemOrNullObject(targetId);
+      slide.load("id,isNullObject");
+      await context.sync();
+      if (slide && slide.isNullObject === false) {
+        return slide;
+      }
+    }
+  } catch (_error) {
+    // fall through
+  }
+
+  return null;
 }
 
 function getSelectedShapeIdsFromContext(slideContext) {

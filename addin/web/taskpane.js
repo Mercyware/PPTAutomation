@@ -21,7 +21,9 @@
       isAddingReference: false,
       isApplyingPlan: false,
       referenceDialogResolver: null,
-      sourceLinksBySlide: {}
+      sourceLinksBySlide: {},
+      previewSession: null,
+      versionHistory: null
     };
   }
   if (typeof window.PPTAutomation.uiState.isApplyingPlan !== 'boolean') {
@@ -53,6 +55,18 @@
   }
   if (typeof window.PPTAutomation.uiState.suppressAutoRecommendUntil !== 'number') {
     window.PPTAutomation.uiState.suppressAutoRecommendUntil = 0;
+  }
+  if (
+    !window.PPTAutomation.uiState.previewSession ||
+    typeof window.PPTAutomation.uiState.previewSession !== 'object'
+  ) {
+    window.PPTAutomation.uiState.previewSession = null;
+  }
+  if (
+    !window.PPTAutomation.uiState.versionHistory ||
+    typeof window.PPTAutomation.uiState.versionHistory !== 'object'
+  ) {
+    window.PPTAutomation.uiState.versionHistory = null;
   }
 
   function setStatus(message) {
@@ -117,6 +131,9 @@
     if (uiState.isRecommending || uiState.isAddingReference || uiState.isApplyingPlan) {
       return false;
     }
+    if (uiState.previewSession) {
+      return false;
+    }
     if (nowMs() < Number(uiState.suppressAutoRecommendUntil || 0)) {
       return false;
     }
@@ -131,9 +148,13 @@
 
   function hidePreviewOverlay() {
     var overlay = document.getElementById('previewOverlay');
+    var previewState = document.getElementById('overlayPreviewState');
     if (!overlay) return;
     overlay.classList.add('hidden');
     overlay.setAttribute('aria-hidden', 'true');
+    if (previewState) {
+      previewState.textContent = '';
+    }
   }
 
   function hideReferenceOverlay() {
@@ -189,18 +210,26 @@
     });
   }
 
-  function showPreviewOverlay(plan) {
+  function showPreviewOverlay(plan, options) {
     var overlay = document.getElementById('previewOverlay');
     var summary = document.getElementById('overlaySummary');
+    var previewState = document.getElementById('overlayPreviewState');
     var warnings = document.getElementById('overlayWarnings');
     var operations = document.getElementById('overlayOperations');
     if (!overlay || !summary || !warnings || !operations) return;
+    var opts = options || {};
 
     summary.textContent = (plan && plan.summary) ? plan.summary : 'Review the generated plan before applying.';
+    if (previewState) {
+      previewState.textContent = opts.previewMessage || '';
+    }
     warnings.innerHTML = '';
     operations.innerHTML = '';
 
-    var planWarnings = plan && Array.isArray(plan.warnings) ? plan.warnings : [];
+    var planWarnings = plan && Array.isArray(plan.warnings) ? plan.warnings.slice() : [];
+    if (Array.isArray(opts.runtimeWarnings) && opts.runtimeWarnings.length) {
+      planWarnings = planWarnings.concat(opts.runtimeWarnings);
+    }
     for (var i = 0; i < planWarnings.length; i += 1) {
       var wp = document.createElement('p');
       wp.textContent = '- ' + planWarnings[i];
@@ -680,6 +709,442 @@
     }
     uiState.recommendationMonitorStarted = true;
     scheduleRecommendationMonitorTick(300);
+  }
+
+  function isSlidePreviewApiSupported() {
+    if (!Office || !Office.context || !Office.context.requirements) {
+      return false;
+    }
+    if (typeof Office.context.requirements.isSetSupported !== 'function') {
+      return false;
+    }
+    return Office.context.requirements.isSetSupported('PowerPointApi', '1.8');
+  }
+
+  function slideIdsFromCollection(slides) {
+    var ids = [];
+    var items = slides && Array.isArray(slides.items) ? slides.items : [];
+    for (var i = 0; i < items.length; i += 1) {
+      var slideId = items[i] && items[i].id;
+      if (typeof slideId === 'string' && slideId) {
+        ids.push(slideId);
+      }
+    }
+    return ids;
+  }
+
+  function findSlideByIdInCollection(slides, slideId) {
+    var items = slides && Array.isArray(slides.items) ? slides.items : [];
+    for (var i = 0; i < items.length; i += 1) {
+      if (items[i] && items[i].id === slideId) {
+        return items[i];
+      }
+    }
+    return null;
+  }
+
+  function getSlideIndexById(slides, slideId) {
+    var items = slides && Array.isArray(slides.items) ? slides.items : [];
+    for (var i = 0; i < items.length; i += 1) {
+      if (items[i] && items[i].id === slideId) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  function setButtonDisabled(id, disabled) {
+    var button = document.getElementById(id);
+    if (button) {
+      button.disabled = Boolean(disabled);
+    }
+  }
+
+  function canUndoAcceptedVersion() {
+    var history = window.PPTAutomation.uiState.versionHistory;
+    return Boolean(
+      history &&
+      Array.isArray(history.versions) &&
+      history.versions.length > 1 &&
+      Number(history.currentIndex) > 0 &&
+      typeof history.currentSlideId === 'string' &&
+      history.currentSlideId
+    );
+  }
+
+  function canRedoAcceptedVersion() {
+    var history = window.PPTAutomation.uiState.versionHistory;
+    return Boolean(
+      history &&
+      Array.isArray(history.versions) &&
+      history.versions.length > 1 &&
+      Number(history.currentIndex) >= 0 &&
+      Number(history.currentIndex) < history.versions.length - 1 &&
+      typeof history.currentSlideId === 'string' &&
+      history.currentSlideId
+    );
+  }
+
+  function updateUndoRedoButtons() {
+    var uiState = window.PPTAutomation.uiState;
+    var isBusy = uiState.isRecommending || uiState.isAddingReference || uiState.isApplyingPlan || Boolean(uiState.previewSession);
+    setButtonDisabled('undoAcceptedBtn', isBusy || !canUndoAcceptedVersion());
+    setButtonDisabled('redoAcceptedBtn', isBusy || !canRedoAcceptedVersion());
+  }
+
+  function clearPreviewState() {
+    var uiState = window.PPTAutomation.uiState;
+    uiState.previewSession = null;
+    uiState.pendingPlan = null;
+    uiState.latestPlan = null;
+    hidePreviewOverlay();
+    updateUndoRedoButtons();
+  }
+
+  function getActiveSlideDescriptor() {
+    if (!isSlidePreviewApiSupported()) {
+      return Promise.reject(new Error('This PowerPoint host does not support slide preview APIs.'));
+    }
+
+    return PowerPoint.run(function (context) {
+      var slides = context.presentation.slides;
+      slides.load('items/id');
+
+      return context.sync()
+        .then(function () {
+          return resolveActiveSlide(context, slides);
+        })
+        .then(function (activeSlide) {
+          if (!activeSlide) {
+            return null;
+          }
+          activeSlide.load('id');
+          return context.sync().then(function () {
+            return {
+              slideId: activeSlide.id,
+              index: getSlideIndexById(slides, activeSlide.id)
+            };
+          });
+        });
+    });
+  }
+
+  function exportSlideSnapshot(slideId) {
+    if (!slideId) {
+      return Promise.reject(new Error('A slide must be selected first.'));
+    }
+
+    return PowerPoint.run(function (context) {
+      var slides = context.presentation.slides;
+      slides.load('items/id');
+
+      return context.sync()
+        .then(function () {
+          var slide = findSlideByIdInCollection(slides, slideId);
+          if (!slide || typeof slide.exportAsBase64 !== 'function') {
+            throw new Error('Unable to export the selected slide.');
+          }
+          var exported = slide.exportAsBase64();
+          return context.sync().then(function () {
+            var value = exported && typeof exported.value === 'string' ? exported.value : '';
+            if (!value) {
+              throw new Error('Slide export returned no data.');
+            }
+            return value;
+          });
+        });
+    });
+  }
+
+  function insertSlideSnapshotAfter(snapshotBase64, targetSlideId) {
+    if (!snapshotBase64) {
+      return Promise.reject(new Error('Slide snapshot data is missing.'));
+    }
+
+    return PowerPoint.run(function (context) {
+      var slides = context.presentation.slides;
+      slides.load('items/id');
+
+      return context.sync()
+        .then(function () {
+          var beforeIds = slideIdsFromCollection(slides);
+          if (targetSlideId) {
+            context.presentation.insertSlidesFromBase64(snapshotBase64, {
+              targetSlideId: targetSlideId
+            });
+          } else {
+            context.presentation.insertSlidesFromBase64(snapshotBase64);
+          }
+
+          return context.sync().then(function () {
+            slides.load('items/id');
+            return context.sync().then(function () {
+              var afterIds = slideIdsFromCollection(slides);
+              for (var i = 0; i < afterIds.length; i += 1) {
+                if (beforeIds.indexOf(afterIds[i]) < 0) {
+                  return afterIds[i];
+                }
+              }
+              throw new Error('Unable to identify the inserted preview slide.');
+            });
+          });
+        });
+    });
+  }
+
+  function selectSlideById(slideId) {
+    if (!slideId) {
+      return Promise.resolve(false);
+    }
+
+    return PowerPoint.run(function (context) {
+      if (!context.presentation || typeof context.presentation.setSelectedSlides !== 'function') {
+        throw new Error('This PowerPoint host cannot select preview slides.');
+      }
+      context.presentation.setSelectedSlides([slideId]);
+      return context.sync().then(function () {
+        return true;
+      });
+    });
+  }
+
+  function deleteSlideById(slideId) {
+    if (!slideId) {
+      return Promise.resolve(false);
+    }
+
+    return PowerPoint.run(function (context) {
+      var slides = context.presentation.slides;
+      slides.load('items/id');
+
+      return context.sync()
+        .then(function () {
+          var slide = findSlideByIdInCollection(slides, slideId);
+          if (!slide || typeof slide.delete !== 'function') {
+            return false;
+          }
+          slide.delete();
+          return context.sync().then(function () {
+            return true;
+          });
+        });
+    });
+  }
+
+  function safelyDeleteSlideById(slideId) {
+    return deleteSlideById(slideId).catch(function () {
+      return false;
+    });
+  }
+
+  function replaceTrackedSlideWithSnapshot(currentSlideId, snapshotBase64) {
+    var insertedSlideId = '';
+    return insertSlideSnapshotAfter(snapshotBase64, currentSlideId)
+      .then(function (newSlideId) {
+        insertedSlideId = newSlideId;
+        return deleteSlideById(currentSlideId);
+      })
+      .then(function (deleted) {
+        if (!deleted) {
+          return safelyDeleteSlideById(insertedSlideId).then(function () {
+            throw new Error('Failed to replace the current slide version.');
+          });
+        }
+        return selectSlideById(insertedSlideId).then(function () {
+          return insertedSlideId;
+        }, function () {
+          return insertedSlideId;
+        });
+      });
+  }
+
+  function recordAcceptedSlideVersion(previewSession, acceptedSlideBase64) {
+    var uiState = window.PPTAutomation.uiState;
+    var beforeBase64 = previewSession && previewSession.originalSlideBase64
+      ? previewSession.originalSlideBase64
+      : '';
+    var afterBase64 = String(acceptedSlideBase64 || '');
+    var acceptedSlideId = previewSession && previewSession.previewSlideId ? previewSession.previewSlideId : '';
+    var originalSlideId = previewSession && previewSession.originalSlideId ? previewSession.originalSlideId : '';
+    var history = uiState.versionHistory;
+
+    if (!beforeBase64 || !afterBase64 || !acceptedSlideId) {
+      uiState.versionHistory = null;
+      updateUndoRedoButtons();
+      return;
+    }
+
+    if (
+      history &&
+      Array.isArray(history.versions) &&
+      history.currentSlideId === originalSlideId &&
+      Number(history.currentIndex) >= 0
+    ) {
+      history.versions = history.versions.slice(0, history.currentIndex + 1);
+      history.versions[history.currentIndex] = beforeBase64;
+      history.versions.push(afterBase64);
+      history.currentIndex = history.versions.length - 1;
+      history.currentSlideId = acceptedSlideId;
+    } else {
+      uiState.versionHistory = {
+        versions: [beforeBase64, afterBase64],
+        currentIndex: 1,
+        currentSlideId: acceptedSlideId
+      };
+    }
+
+    updateUndoRedoButtons();
+  }
+
+  function createPlanPreviewOnDuplicateSlide(plan, slideContext) {
+    var uiState = window.PPTAutomation.uiState;
+    var originalSlide = null;
+    var previewSession = null;
+
+    if (typeof window.PPTAutomation.applyExecutionPlan !== 'function') {
+      return Promise.reject(new Error('Plan applier is unavailable.'));
+    }
+    if (uiState.previewSession) {
+      return Promise.reject(new Error('Accept or reject the current preview first.'));
+    }
+    if (!isSlidePreviewApiSupported()) {
+      return Promise.reject(new Error('This PowerPoint host does not support live slide previews.'));
+    }
+
+    return Promise.resolve()
+      .then(function () {
+        return getActiveSlideDescriptor();
+      })
+      .then(function (activeSlide) {
+        if (!activeSlide || !activeSlide.slideId) {
+          throw new Error('Select a slide before generating a preview.');
+        }
+        originalSlide = activeSlide;
+        return exportSlideSnapshot(activeSlide.slideId);
+      })
+      .then(function (originalBase64) {
+        previewSession = {
+          originalSlideId: originalSlide.slideId,
+          originalSlideIndex: originalSlide.index,
+          originalSlideBase64: originalBase64,
+          previewSlideId: ''
+        };
+        return insertSlideSnapshotAfter(originalBase64, originalSlide.slideId);
+      })
+      .then(function (previewSlideId) {
+        previewSession.previewSlideId = previewSlideId;
+        return selectSlideById(previewSlideId).then(function () {
+          return window.PPTAutomation.applyExecutionPlan(plan, slideContext, {
+            targetSlideId: previewSlideId
+          });
+        });
+      })
+      .then(function (applyResult) {
+        uiState.previewSession = previewSession;
+        updateUndoRedoButtons();
+        return {
+          previewSession: previewSession,
+          applyResult: applyResult || { appliedCount: 0, warnings: [] }
+        };
+      })
+      .catch(function (error) {
+        return Promise.resolve()
+          .then(function () {
+            if (previewSession && previewSession.previewSlideId) {
+              return safelyDeleteSlideById(previewSession.previewSlideId);
+            }
+            return false;
+          })
+          .then(function () {
+            if (originalSlide && originalSlide.slideId) {
+              return selectSlideById(originalSlide.slideId).catch(function () {
+                return false;
+              });
+            }
+            return false;
+          })
+          .then(function () {
+            throw error;
+          });
+      });
+  }
+
+  function acceptPreviewSession() {
+    var uiState = window.PPTAutomation.uiState;
+    var previewSession = uiState.previewSession;
+    if (!previewSession || !previewSession.previewSlideId || !previewSession.originalSlideId) {
+      return Promise.reject(new Error('No preview slide is ready to accept.'));
+    }
+
+    var acceptedBase64 = '';
+    return exportSlideSnapshot(previewSession.previewSlideId)
+      .then(function (snapshotBase64) {
+        acceptedBase64 = snapshotBase64;
+        return deleteSlideById(previewSession.originalSlideId);
+      })
+      .then(function (deleted) {
+        if (!deleted) {
+          throw new Error('Failed to finalize the preview slide.');
+        }
+        return selectSlideById(previewSession.previewSlideId).catch(function () {
+          return false;
+        });
+      })
+      .then(function () {
+        recordAcceptedSlideVersion(previewSession, acceptedBase64);
+        clearPreviewState();
+      });
+  }
+
+  function rejectPreviewSession() {
+    var uiState = window.PPTAutomation.uiState;
+    var previewSession = uiState.previewSession;
+    if (!previewSession || !previewSession.previewSlideId) {
+      clearPreviewState();
+      return Promise.resolve(false);
+    }
+
+    return deleteSlideById(previewSession.previewSlideId)
+      .then(function () {
+        if (previewSession.originalSlideId) {
+          return selectSlideById(previewSession.originalSlideId).catch(function () {
+            return false;
+          });
+        }
+        return false;
+      })
+      .then(function () {
+        clearPreviewState();
+        return true;
+      });
+  }
+
+  function restoreAcceptedSlideVersion(direction) {
+    var uiState = window.PPTAutomation.uiState;
+    var history = uiState.versionHistory;
+    var isUndo = direction === 'undo';
+    if (!history || !Array.isArray(history.versions) || !history.currentSlideId) {
+      return Promise.reject(new Error('No accepted slide version is available.'));
+    }
+
+    var targetIndex = isUndo ? (history.currentIndex - 1) : (history.currentIndex + 1);
+    if (targetIndex < 0 || targetIndex >= history.versions.length) {
+      return Promise.reject(new Error(isUndo ? 'Nothing to undo.' : 'Nothing to redo.'));
+    }
+
+    var snapshotBase64 = history.versions[targetIndex];
+    return replaceTrackedSlideWithSnapshot(history.currentSlideId, snapshotBase64)
+      .then(function (restoredSlideId) {
+        history.currentSlideId = restoredSlideId;
+        history.currentIndex = targetIndex;
+        updateUndoRedoButtons();
+        return restoredSlideId;
+      })
+      .catch(function (error) {
+        uiState.versionHistory = null;
+        updateUndoRedoButtons();
+        throw error;
+      });
   }
 
   function requestPlan(payload) {
@@ -2127,47 +2592,119 @@
   function handleApplyPlan() {
     var uiState = window.PPTAutomation.uiState;
     var plan = uiState.pendingPlan;
-    var latestContext = uiState.latestSlideContext || {};
 
     if (!plan) {
-      setStatus('Generate a plan first.');
+      setStatus('Generate a preview first.');
       return;
     }
 
-    if (typeof window.PPTAutomation.applyExecutionPlan !== 'function') {
-      setStatus('Plan applier is unavailable.');
+    if (!uiState.previewSession) {
+      setStatus('Preview slide is not ready yet.');
       return;
     }
 
-    setStatus('Applying plan to slide...');
+    setStatus('Accepting preview slide...');
     uiState.isApplyingPlan = true;
     suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
-    window.PPTAutomation.applyExecutionPlan(plan, latestContext)
-      .then(function (result) {
-        var warnings = result && Array.isArray(result.warnings) ? result.warnings : [];
-        var applied = result && typeof result.appliedCount === 'number' ? result.appliedCount : 0;
-        var warningSummary = warnings.length ? ' Warnings: ' + warnings.join(' | ') : '';
-        setStatus('Applied ' + applied + ' operation(s).' + warningSummary);
-        uiState.pendingPlan = null;
-        hidePreviewOverlay();
+    acceptPreviewSession()
+      .then(function () {
+        setStatus('Preview accepted. Undo is available.');
       })
       .catch(function (error) {
-        setStatus((error && error.message) || 'Failed to apply plan');
+        setStatus((error && error.message) || 'Failed to accept preview');
       })
       .then(function () {
         uiState.isApplyingPlan = false;
+        updateUndoRedoButtons();
       });
   }
 
   function handleRejectPlan() {
-    window.PPTAutomation.uiState.pendingPlan = null;
-    hidePreviewOverlay();
-    setStatus('Plan rejected. No changes were applied.');
+    var uiState = window.PPTAutomation.uiState;
+    if (!uiState.previewSession) {
+      clearPreviewState();
+      setStatus('Preview rejected. No changes were applied.');
+      updateUndoRedoButtons();
+      return;
+    }
+
+    setStatus('Rejecting preview slide...');
+    uiState.isApplyingPlan = true;
+    suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
+    rejectPreviewSession()
+      .then(function () {
+        setStatus('Preview rejected. Original slide restored.');
+      })
+      .catch(function (error) {
+        setStatus((error && error.message) || 'Failed to reject preview');
+      })
+      .then(function () {
+        uiState.isApplyingPlan = false;
+        updateUndoRedoButtons();
+      });
+  }
+
+  function handleUndoAccepted() {
+    var uiState = window.PPTAutomation.uiState;
+    if (uiState.previewSession) {
+      setStatus('Accept or reject the current preview first.');
+      return;
+    }
+    if (!canUndoAcceptedVersion()) {
+      setStatus('Nothing to undo.');
+      return;
+    }
+
+    setStatus('Restoring previous accepted slide version...');
+    uiState.isApplyingPlan = true;
+    suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
+    restoreAcceptedSlideVersion('undo')
+      .then(function () {
+        setStatus('Restored the previous accepted slide version.');
+      })
+      .catch(function (error) {
+        setStatus((error && error.message) || 'Undo failed.');
+      })
+      .then(function () {
+        uiState.isApplyingPlan = false;
+        updateUndoRedoButtons();
+      });
+  }
+
+  function handleRedoAccepted() {
+    var uiState = window.PPTAutomation.uiState;
+    if (uiState.previewSession) {
+      setStatus('Accept or reject the current preview first.');
+      return;
+    }
+    if (!canRedoAcceptedVersion()) {
+      setStatus('Nothing to redo.');
+      return;
+    }
+
+    setStatus('Restoring the newer accepted slide version...');
+    uiState.isApplyingPlan = true;
+    suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
+    restoreAcceptedSlideVersion('redo')
+      .then(function () {
+        setStatus('Restored the newer accepted slide version.');
+      })
+      .catch(function (error) {
+        setStatus((error && error.message) || 'Redo failed.');
+      })
+      .then(function () {
+        uiState.isApplyingPlan = false;
+        updateUndoRedoButtons();
+      });
   }
 
   function handleAddReference() {
     var uiState = window.PPTAutomation.uiState;
     if (uiState.isAddingReference) return;
+    if (uiState.previewSession) {
+      setStatus('Accept or reject the current preview first.');
+      return;
+    }
 
     var addReferenceBtn = document.getElementById('addReferenceBtn');
     if (typeof window.PPTAutomation.collectSlideContext !== 'function') {
@@ -2178,10 +2715,12 @@
     uiState.isAddingReference = true;
     if (addReferenceBtn) addReferenceBtn.disabled = true;
     suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
+    updateUndoRedoButtons();
 
     function cleanup() {
       uiState.isAddingReference = false;
       if (addReferenceBtn) addReferenceBtn.disabled = false;
+      updateUndoRedoButtons();
     }
 
     setStatus('Reading selected item...');
@@ -2290,6 +2829,10 @@
     var trigger = opts.trigger === 'idle' ? 'idle' : 'manual';
     var uiState = window.PPTAutomation.uiState;
     if (uiState.isRecommending) return Promise.resolve(false);
+    if (uiState.previewSession) {
+      setStatus('Accept or reject the current preview first.');
+      return Promise.resolve(false);
+    }
     if (trigger === 'idle' && !shouldAllowAutomaticRecommendation()) {
       return Promise.resolve(false);
     }
@@ -2306,6 +2849,7 @@
     uiState.isRecommending = true;
     if (recommendBtn) recommendBtn.disabled = true;
     clearPendingAutoRecommendation();
+    updateUndoRedoButtons();
 
     setStatus(trigger === 'idle' ? 'Typing paused. Reading slide...' : 'Reading slide...');
     if (recEl) recEl.innerHTML = '';
@@ -2318,6 +2862,7 @@
     function cleanupRecommendState() {
       uiState.isRecommending = false;
       if (recommendBtn) recommendBtn.disabled = false;
+      updateUndoRedoButtons();
     }
 
     return Promise.resolve()
@@ -2362,10 +2907,32 @@
             .then(function (planPayload) {
               var plan = planPayload && planPayload.plan ? planPayload.plan : null;
               if (previewEl) previewEl.textContent = JSON.stringify(plan, null, 2);
-              uiState.latestPlan = plan;
-              uiState.pendingPlan = plan;
-              showPreviewOverlay(plan || {});
-              setStatus('Plan generated. Confirm or reject in preview overlay.');
+              if (!plan) {
+                throw new Error('Plan generation returned no plan.');
+              }
+              setStatus('Creating live slide preview...');
+              uiState.isApplyingPlan = true;
+              suppressAutoRecommendations(AUTO_RECOMMEND_SUPPRESSION_MS);
+              return createPlanPreviewOnDuplicateSlide(plan, summarized)
+                .then(function (previewResult) {
+                  var applyResult = previewResult && previewResult.applyResult ? previewResult.applyResult : {};
+                  uiState.latestPlan = plan;
+                  uiState.pendingPlan = plan;
+                  showPreviewOverlay(plan, {
+                    previewMessage: 'A duplicated preview slide is now selected in PowerPoint. Review it, then accept or reject here.',
+                    runtimeWarnings: Array.isArray(applyResult.warnings) ? applyResult.warnings : []
+                  });
+                  var appliedCount = typeof applyResult.appliedCount === 'number' ? applyResult.appliedCount : 0;
+                  setStatus('Preview ready on a duplicated slide. ' + String(appliedCount) + ' operation(s) applied.');
+                })
+                .then(function () {
+                  uiState.isApplyingPlan = false;
+                  updateUndoRedoButtons();
+                }, function (error) {
+                  uiState.isApplyingPlan = false;
+                  updateUndoRedoButtons();
+                  throw error;
+                });
             })
             .catch(function (error) {
               setStatus((error && error.message) || 'Plan generation failed');
@@ -2469,6 +3036,8 @@
 
     var recommendBtn = document.getElementById('recommendBtn');
     var addReferenceBtn = document.getElementById('addReferenceBtn');
+    var undoAcceptedBtn = document.getElementById('undoAcceptedBtn');
+    var redoAcceptedBtn = document.getElementById('redoAcceptedBtn');
     var confirmApplyBtn = document.getElementById('confirmApplyBtn');
     var rejectApplyBtn = document.getElementById('rejectApplyBtn');
     var confirmReferenceBtn = document.getElementById('confirmReferenceBtn');
@@ -2478,6 +3047,8 @@
 
     if (recommendBtn) recommendBtn.addEventListener('click', handleRecommend);
     if (addReferenceBtn) addReferenceBtn.addEventListener('click', handleAddReference);
+    if (undoAcceptedBtn) undoAcceptedBtn.addEventListener('click', handleUndoAccepted);
+    if (redoAcceptedBtn) redoAcceptedBtn.addEventListener('click', handleRedoAccepted);
     if (confirmApplyBtn) confirmApplyBtn.addEventListener('click', handleApplyPlan);
     if (rejectApplyBtn) rejectApplyBtn.addEventListener('click', handleRejectPlan);
     if (confirmReferenceBtn) confirmReferenceBtn.addEventListener('click', handleConfirmReferenceInput);
@@ -2503,6 +3074,7 @@
 
     hideReferenceOverlay();
     startRecommendationIdleMonitor();
+    updateUndoRedoButtons();
 
     setStatus('Ready.');
     fetchBackendHealthSummary()
@@ -2518,6 +3090,8 @@
   window.PPTAutomation.handleAddReference = handleAddReference;
   window.PPTAutomation.handleApplyPlan = handleApplyPlan;
   window.PPTAutomation.handleRejectPlan = handleRejectPlan;
+  window.PPTAutomation.handleUndoAccepted = handleUndoAccepted;
+  window.PPTAutomation.handleRedoAccepted = handleRedoAccepted;
 
   window.addEventListener('error', function (event) {
     var err = event && event.error ? event.error : null;

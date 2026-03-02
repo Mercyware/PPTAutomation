@@ -81,6 +81,11 @@ button:hover {
   background: #09573f;
 }
 
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .secondary {
   background: #475467;
 }
@@ -196,6 +201,12 @@ button:hover {
   margin: 8px 0 10px;
   font-size: 13px;
   color: #1d2939;
+}
+
+.overlay-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: #475467;
 }
 
 .overlay-warnings {

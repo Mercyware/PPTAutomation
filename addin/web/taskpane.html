@@ -18,6 +18,8 @@
       <div class="actions">
         <button id="recommendBtn" type="button" onclick="if(window.PPTAutomation && window.PPTAutomation.handleRecommend){window.PPTAutomation.handleRecommend();}">Get Recommendations</button>
         <button id="addReferenceBtn" type="button" class="secondary" onclick="if(window.PPTAutomation && window.PPTAutomation.handleAddReference){window.PPTAutomation.handleAddReference();}">Add Reference</button>
+        <button id="undoAcceptedBtn" type="button" class="secondary" disabled>Undo</button>
+        <button id="redoAcceptedBtn" type="button" class="secondary" disabled>Redo</button>
       </div>
       <p class="subtle compact">Select a slide item first, then let AI find and add a trusted source link.</p>
 
@@ -38,11 +40,12 @@
       <div class="overlay-card">
         <h2>Review Before Apply</h2>
         <p id="overlaySummary" class="overlay-summary"></p>
+        <p id="overlayPreviewState" class="overlay-note"></p>
         <div id="overlayWarnings" class="overlay-warnings"></div>
         <div id="overlayOperations" class="overlay-ops"></div>
         <div class="overlay-actions">
-          <button id="confirmApplyBtn" type="button">Confirm Apply</button>
-          <button id="rejectApplyBtn" type="button" class="secondary">Reject</button>
+          <button id="confirmApplyBtn" type="button">Accept Preview</button>
+          <button id="rejectApplyBtn" type="button" class="secondary">Reject Preview</button>
         </div>
       </div>
     </div>
