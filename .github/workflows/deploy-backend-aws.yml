@@ -1,0 +1,75 @@
+name: Deploy Backend To AWS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/**"
+      - ".github/workflows/deploy-backend-aws.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-backend-aws
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.BACKEND_ECR_REPOSITORY }}
+      APP_RUNNER_SERVICE_ARN: ${{ vars.BACKEND_APP_RUNNER_SERVICE_ARN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${{ secrets.AWS_ROLE_TO_ASSUME }}"
+          test -n "${AWS_REGION}"
+          test -n "${ECR_REPOSITORY}"
+          test -n "${APP_RUNNER_SERVICE_ARN}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        id: build-image
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          IMAGE_BASE="${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}"
+          IMAGE_SHA="${IMAGE_BASE}:${SHORT_SHA}"
+          IMAGE_LATEST="${IMAGE_BASE}:latest"
+          docker build -f server/Dockerfile -t "${IMAGE_SHA}" -t "${IMAGE_LATEST}" server
+          docker push "${IMAGE_SHA}"
+          docker push "${IMAGE_LATEST}"
+          echo "image=${IMAGE_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Trigger App Runner deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws apprunner start-deployment \
+            --service-arn "${APP_RUNNER_SERVICE_ARN}" \
+            --region "${AWS_REGION}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          echo "Deployed backend image: ${{ steps.build-image.outputs.image }}"

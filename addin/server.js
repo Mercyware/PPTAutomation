@@ -3,8 +3,15 @@ const https = require("https");
 const express = require("express");
 const devCerts = require("office-addin-dev-certs");
 
-const PORT = Number(process.env.ADDIN_PORT || 3100);
+const PORT = Number(process.env.PORT || process.env.ADDIN_PORT || 3100);
 const BACKEND_BASE_URL = process.env.BACKEND_BASE_URL || "http://localhost:4000";
+const useDevCertEnv = String(process.env.USE_DEV_CERTS || "").trim().toLowerCase();
+const USE_DEV_CERTS =
+  useDevCertEnv === "true" ? true : useDevCertEnv === "false" ? false : process.env.NODE_ENV !== "production";
+
+if (!Number.isFinite(PORT) || PORT <= 0) {
+  throw new Error("Invalid PORT/ADDIN_PORT value.");
+}
 
 async function start() {
   const app = express();
@@ -92,9 +99,16 @@ async function start() {
     res.json({ ok: true, service: "ppt-automation-addin-web", port: PORT });
   });
 
-  const httpsOptions = await devCerts.getHttpsServerOptions();
-  https.createServer(httpsOptions, app).listen(PORT, () => {
-    console.log(`addin web host running at https://localhost:${PORT}`);
+  if (USE_DEV_CERTS) {
+    const httpsOptions = await devCerts.getHttpsServerOptions();
+    https.createServer(httpsOptions, app).listen(PORT, () => {
+      console.log(`addin web host running at https://localhost:${PORT} (dev cert mode)`);
+    });
+    return;
+  }
+
+  app.listen(PORT, () => {
+    console.log(`addin web host running at http://0.0.0.0:${PORT} (hosted mode)`);
   });
 }
 

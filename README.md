@@ -195,6 +195,15 @@ cd addin
 npm run stop
 ```
 
+## AWS hosting (MVP)
+
+CI/CD workflows and Dockerfiles for AWS App Runner deployment are included.
+
+- Backend deploy workflow: `.github/workflows/deploy-backend-aws.yml`
+- Addin deploy workflow: `.github/workflows/deploy-addin-aws.yml`
+- Setup guide: `docs/aws-hosting.md`
+- Hosted manifest generator: `addin/scripts/generate-hosted-manifest.ps1`
+
 ## API (initial)
 
 ### `GET /health`
